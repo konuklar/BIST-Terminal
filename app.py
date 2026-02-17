@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-📊 ADVANCED BIST Risk Budgeting System (Streamlit Cloud)
+📊 ADVANCED BIST Risk Budgeting System (Streamlit Cloud) - ENHANCED VERSION
 Enhanced with:
-- BIST100 benchmark integration (Yahoo Finance only)
-- Benchmark-relative (active) risk contributions panel
-- Stress scenarios module (FX shock / Rate shock proxies from Yahoo Finance)
-- PyPortfolioOpt portfolio strategies (Mean-Variance / HRP / Black-Litterman / CLA where available)
-- VaR / CVaR / ES + rolling risk contributions
-- Professional visualizations + robust data alignment + forward-fill only (NO synthetic data)
+- Robust multi-strategy data fetching with fallbacks
+- Advanced risk metrics (tail risk, drawdown analysis, factor models)
+- Professional visualizations with interactive dashboards
+- Monte Carlo simulation for stress testing
+- Enhanced PyPortfolioOpt integration
+- Performance attribution and benchmarking
+- Export capabilities with comprehensive reports
 
 Footer statement:
 "The Quantitative Analysis Performed by LabGen25@Istanbul by Murat KONUKLAR 2026"
@@ -21,14 +22,21 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from io import BytesIO
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
+import concurrent.futures
+import time
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import streamlit as st
 import plotly.graph_objects as go
-from scipy.optimize import minimize
+import plotly.express as px
+from plotly.subplots import make_subplots
+from scipy.optimize import minimize, differential_evolution
+from scipy import stats
+from scipy.cluster.hierarchy import dendrogram, linkage, fcluster
+from scipy.spatial.distance import squareform
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 logging.getLogger("yfinance").setLevel(logging.ERROR)
@@ -46,56 +54,85 @@ try:
     )
     from pypfopt.hierarchical_risk_parity import HRPOpt
     PYPFOPT_AVAILABLE = True
-except Exception:
+except Exception as e:
     PYPFOPT_AVAILABLE = False
+    print(f"PyPortfolioOpt import error: {e}")
 
 # ------------------------------------------------------------
 # Page configuration
 # ------------------------------------------------------------
 st.set_page_config(
-    page_title="BIST Advanced Risk Budgeting",
+    page_title="BIST Advanced Risk Budgeting System",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ------------------------------------------------------------
-# Custom CSS (keep layout feel)
+# Custom CSS
 # ------------------------------------------------------------
 st.markdown(
     """
     <style>
     .main-header {
-        font-size: 2.3rem;
+        font-size: 2.5rem;
         color: #1E3A8A;
         font-weight: 800;
-        margin-bottom: 0.25rem;
+        margin-bottom: 0.5rem;
+        background: linear-gradient(90deg, #1E3A8A 0%, #2563EB 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
     }
     .sub-header {
-        font-size: 1.35rem;
+        font-size: 1.5rem;
         color: #2563EB;
         font-weight: 700;
-        margin-top: 0.8rem;
-        margin-bottom: 0.25rem;
+        margin-top: 1.2rem;
+        margin-bottom: 0.5rem;
+        border-bottom: 2px solid #E5E7EB;
+        padding-bottom: 0.3rem;
+    }
+    .metric-card {
+        background-color: #F8FAFC;
+        border-radius: 0.8rem;
+        padding: 1.2rem;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        border-left: 4px solid #2563EB;
+    }
+    .warning-card {
+        background-color: #FEF3C7;
+        border-radius: 0.8rem;
+        padding: 1rem;
+        border-left: 4px solid #F59E0B;
     }
     .data-source-badge {
         background-color: #1E3A8A;
         color: white;
-        padding: 0.3rem 0.8rem;
-        border-radius: 1rem;
-        font-size: 0.85rem;
+        padding: 0.4rem 1rem;
+        border-radius: 2rem;
+        font-size: 0.9rem;
         display: inline-block;
-        margin: 0.2rem 0 1rem 0;
+        margin: 0.5rem 0 1rem 0;
     }
     .note-box {
         background-color: #F3F4F6;
         border: 1px solid #E5E7EB;
         padding: 0.75rem 1rem;
         border-radius: 0.6rem;
+        font-size: 0.9rem;
     }
     .small-muted {
         color: #6B7280;
         font-size: 0.85rem;
+        font-style: italic;
+    }
+    .footer {
+        text-align: center;
+        padding: 2rem 0 0 0;
+        color: #6B7280;
+        font-size: 0.9rem;
+        border-top: 1px solid #E5E7EB;
+        margin-top: 2rem;
     }
     </style>
     """,
@@ -103,846 +140,1368 @@ st.markdown(
 )
 
 # ------------------------------------------------------------
-# Universe (BIST 50 constituents - static list, ASCII tickers)
-# TRALTIN removed as requested; ASTOR included as requested.
+# Universe (BIST 50 constituents - enhanced with metadata)
 # ------------------------------------------------------------
 BIST50_TICKERS = [
     "AEFES.IS", "AKBNK.IS", "ALARK.IS", "ARCLK.IS", "ASELS.IS",
     "ASTOR.IS", "BIMAS.IS", "BRSAN.IS", "BTCIM.IS", "CCOLA.IS",
-    "CIMSA.IS", "DOAS.IS", "DOHOL.IS", "DSTKF.IS", "EKGYO.IS",
-    "ENKAI.IS", "EREGL.IS", "FROTO.IS", "GARAN.IS", "GUBRF.IS",
-    "HALKB.IS", "HEKTS.IS", "ISCTR.IS", "KCHOL.IS", "KONTR.IS",
-    "KRDMD.IS", "KUYAS.IS", "MAVI.IS", "MGROS.IS", "MIATK.IS",
-    "OYAKC.IS", "PASEU.IS", "PETKM.IS", "PGSUS.IS", "SAHOL.IS",
-    "SASA.IS", "SISE.IS", "SOKM.IS", "TAVHL.IS", "TCELL.IS",
-    "THYAO.IS", "TOASO.IS", "TRMET.IS", "TSKB.IS", "TTKOM.IS",
+    "CIMSA.IS", "DOAS.IS", "DOHOL.IS", "EKGYO.IS", "ENKAI.IS",
+    "EREGL.IS", "FROTO.IS", "GARAN.IS", "GUBRF.IS", "HALKB.IS",
+    "HEKTS.IS", "ISCTR.IS", "KCHOL.IS", "KONTR.IS", "KRDMD.IS",
+    "MAVI.IS", "MGROS.IS", "MIATK.IS", "OYAKC.IS", "PGSUS.IS",
+    "SAHOL.IS", "SASA.IS", "SISE.IS", "SOKM.IS", "TAVHL.IS",
+    "TCELL.IS", "THYAO.IS", "TOASO.IS", "TSKB.IS", "TTKOM.IS",
     "TUPRS.IS", "ULKER.IS", "VAKBN.IS", "VESTL.IS", "YKBNK.IS",
 ]
 
-# Benchmark candidates (Yahoo Finance only)
-BENCHMARK_CANDIDATES = ["^XU100", "XU100.IS"]  # try both, keep what works
-
-# Stress factor proxies (Yahoo Finance only)
-FX_FACTOR = "TRY=X"     # USD/TRY (Yahoo)
-RATE_FACTOR = "^TNX"    # US 10Y yield proxy (Yahoo). Turkey 10Y is not reliably available on Yahoo.
-
-# Sector map (for caps). Extend anytime; unknown -> "Other".
-SECTOR_MAP = {
-    "AKBNK.IS": "Banking", "GARAN.IS": "Banking", "HALKB.IS": "Banking", "ISCTR.IS": "Banking",
-    "VAKBN.IS": "Banking", "YKBNK.IS": "Banking", "TSKB.IS": "Banking",
-    "KCHOL.IS": "Holding", "SAHOL.IS": "Holding", "ALARK.IS": "Holding",
-    "BIMAS.IS": "Retail", "MGROS.IS": "Retail", "SOKM.IS": "Retail",
-    "TCELL.IS": "Telecom", "TTKOM.IS": "Telecom",
-    "THYAO.IS": "Aviation", "PGSUS.IS": "Aviation", "TAVHL.IS": "Aviation",
-    "TUPRS.IS": "Energy", "PETKM.IS": "Petrochemical", "EREGL.IS": "Iron&Steel", "KRDMD.IS": "Iron&Steel",
-    "ASELS.IS": "Defense", "KONTR.IS": "Technology", "MIATK.IS": "Technology", "ASTOR.IS": "Technology",
-    "ULKER.IS": "Consumer", "CCOLA.IS": "Consumer", "AEFES.IS": "Consumer",
-    "SASA.IS": "Chemicals", "GUBRF.IS": "Chemicals", "HEKTS.IS": "Chemicals",
-    "ARCLK.IS": "Industrial", "FROTO.IS": "Automotive", "TOASO.IS": "Automotive",
-    "BRSAN.IS": "Industrial", "OYAKC.IS": "Industrial", "CIMSA.IS": "Industrial", "BTCIM.IS": "Industrial",
-    "SISE.IS": "Industrial",
-    "DOAS.IS": "Industrial", "DOHOL.IS": "Holding", "EKGYO.IS": "RealEstate",
-    "ENKAI.IS": "Industrial", "KUYAS.IS": "Other", "DSTKF.IS": "Other",
-    "MAVI.IS": "Retail", "TRMET.IS": "Other", "PASEU.IS": "Other",
+# Enhanced metadata with company names and sectors
+COMPANY_METADATA = {
+    "AEFES.IS": {"name": "Anadolu Efes", "sector": "Consumer", "market_cap": "Large"},
+    "AKBNK.IS": {"name": "Akbank", "sector": "Banking", "market_cap": "Large"},
+    "ALARK.IS": {"name": "Alarko Holding", "sector": "Holding", "market_cap": "Large"},
+    "ARCLK.IS": {"name": "Arçelik", "sector": "Industrial", "market_cap": "Large"},
+    "ASELS.IS": {"name": "Aselsan", "sector": "Defense", "market_cap": "Large"},
+    "ASTOR.IS": {"name": "Astor Enerji", "sector": "Technology", "market_cap": "Mid"},
+    "BIMAS.IS": {"name": "BİM Mağazalar", "sector": "Retail", "market_cap": "Large"},
+    "BRSAN.IS": {"name": "Borusan Mannesmann", "sector": "Industrial", "market_cap": "Mid"},
+    "BTCIM.IS": {"name": "Batıçim", "sector": "Industrial", "market_cap": "Mid"},
+    "CCOLA.IS": {"name": "Coca-Cola İçecek", "sector": "Consumer", "market_cap": "Large"},
+    "CIMSA.IS": {"name": "Çimsa", "sector": "Industrial", "market_cap": "Mid"},
+    "DOAS.IS": {"name": "Doğuş Otomotiv", "sector": "Automotive", "market_cap": "Large"},
+    "DOHOL.IS": {"name": "Doğan Holding", "sector": "Holding", "market_cap": "Large"},
+    "EKGYO.IS": {"name": "Emlak Konut", "sector": "Real Estate", "market_cap": "Large"},
+    "ENKAI.IS": {"name": "Enka İnşaat", "sector": "Industrial", "market_cap": "Large"},
+    "EREGL.IS": {"name": "Ereğli Demir Çelik", "sector": "Iron & Steel", "market_cap": "Large"},
+    "FROTO.IS": {"name": "Ford Otosan", "sector": "Automotive", "market_cap": "Large"},
+    "GARAN.IS": {"name": "Garanti BBVA", "sector": "Banking", "market_cap": "Large"},
+    "GUBRF.IS": {"name": "Gübre Fabrikaları", "sector": "Chemicals", "market_cap": "Mid"},
+    "HALKB.IS": {"name": "Halkbank", "sector": "Banking", "market_cap": "Large"},
+    "HEKTS.IS": {"name": "Hektaş", "sector": "Chemicals", "market_cap": "Mid"},
+    "ISCTR.IS": {"name": "İş Bankası", "sector": "Banking", "market_cap": "Large"},
+    "KCHOL.IS": {"name": "Koç Holding", "sector": "Holding", "market_cap": "Large"},
+    "KONTR.IS": {"name": "Kontrolmatik", "sector": "Technology", "market_cap": "Mid"},
+    "KRDMD.IS": {"name": "Kardemir", "sector": "Iron & Steel", "market_cap": "Mid"},
+    "MAVI.IS": {"name": "Mavi Giyim", "sector": "Retail", "market_cap": "Mid"},
+    "MGROS.IS": {"name": "Migros", "sector": "Retail", "market_cap": "Large"},
+    "MIATK.IS": {"name": "Mia Teknoloji", "sector": "Technology", "market_cap": "Mid"},
+    "OYAKC.IS": {"name": "Oyak Çimento", "sector": "Industrial", "market_cap": "Large"},
+    "PGSUS.IS": {"name": "Pegasus", "sector": "Aviation", "market_cap": "Large"},
+    "SAHOL.IS": {"name": "Sabancı Holding", "sector": "Holding", "market_cap": "Large"},
+    "SASA.IS": {"name": "SASA Polyester", "sector": "Chemicals", "market_cap": "Large"},
+    "SISE.IS": {"name": "Şişecam", "sector": "Industrial", "market_cap": "Large"},
+    "SOKM.IS": {"name": "Şok Marketler", "sector": "Retail", "market_cap": "Large"},
+    "TAVHL.IS": {"name": "TAV Havalimanları", "sector": "Aviation", "market_cap": "Large"},
+    "TCELL.IS": {"name": "Turkcell", "sector": "Telecom", "market_cap": "Large"},
+    "THYAO.IS": {"name": "Türk Hava Yolları", "sector": "Aviation", "market_cap": "Large"},
+    "TOASO.IS": {"name": "Tofaş", "sector": "Automotive", "market_cap": "Large"},
+    "TSKB.IS": {"name": "TSKB", "sector": "Banking", "market_cap": "Mid"},
+    "TTKOM.IS": {"name": "Türk Telekom", "sector": "Telecom", "market_cap": "Large"},
+    "TUPRS.IS": {"name": "Tüpraş", "sector": "Energy", "market_cap": "Large"},
+    "ULKER.IS": {"name": "Ülker", "sector": "Consumer", "market_cap": "Large"},
+    "VAKBN.IS": {"name": "Vakıfbank", "sector": "Banking", "market_cap": "Large"},
+    "VESTL.IS": {"name": "Vestel", "sector": "Technology", "market_cap": "Large"},
+    "YKBNK.IS": {"name": "Yapı Kredi", "sector": "Banking", "market_cap": "Large"},
 }
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def _tz_strip_index(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-        df = df.copy()
-        df.index = df.index.tz_localize(None)
-    return df
-
-def _coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for c in out.columns:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out
-
-def sanitize_for_excel(obj: Any) -> pd.DataFrame:
-    if obj is None:
-        return pd.DataFrame()
-    if isinstance(obj, pd.Series):
-        obj = obj.to_frame()
-    if isinstance(obj, dict):
-        try:
-            obj = pd.DataFrame([obj])
-        except Exception:
-            obj = pd.DataFrame({"value": [str(obj)]})
-    if not isinstance(obj, pd.DataFrame):
-        return pd.DataFrame({"value": [str(obj)]})
-
-    df = obj.copy()
-
-    for col in df.columns:
-        if pd.api.types.is_datetime64tz_dtype(df[col]):
-            df[col] = df[col].dt.tz_localize(None)
-        if pd.api.types.is_period_dtype(df[col]) or pd.api.types.is_timedelta64_dtype(df[col]):
-            df[col] = df[col].astype(str)
-
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = _tz_strip_index(df)
-
-    for col in df.columns:
-        if df[col].dtype == "object":
-            df[col] = df[col].map(lambda x: "" if pd.isna(x) else str(x))
-
-    return df
-
-def to_excel_bytes(sheets: Dict[str, Any]) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        for name, obj in sheets.items():
-            df = sanitize_for_excel(obj)
-            if df is None or df.empty:
-                continue
-            df.to_excel(writer, sheet_name=str(name)[:31], index=False)
-    return output.getvalue()
+# Benchmark and factor tickers
+BENCHMARK_CANDIDATES = ["^XU100", "XU100.IS"]
+FX_FACTOR = "TRY=X"
+RATE_FACTOR = "^TNX"
+GOLD_FACTOR = "GC=F"
+OIL_FACTOR = "CL=F"
 
 # ------------------------------------------------------------
-# Yahoo Finance fetcher (NO synthetic data; forward-fill only)
+# Enhanced Data Fetcher with Multi-Strategy and Fallbacks
 # ------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yahoo_prices(
-    tickers: List[str],
-    start: date,
-    end: date,
-) -> Tuple[pd.DataFrame, List[str], Dict[str, str]]:
-    start_str = pd.to_datetime(start).strftime("%Y-%m-%d")
-    end_str = pd.to_datetime(end).strftime("%Y-%m-%d")
-    meta = {"mode": "batch", "note": ""}
-
-    def extract_close(data: pd.DataFrame) -> pd.DataFrame:
-        if data is None or data.empty:
-            return pd.DataFrame()
-        if isinstance(data.columns, pd.MultiIndex):
-            lvl0 = data.columns.get_level_values(0)
-            if "Close" in lvl0:
-                closes = data["Close"]
-            elif "Adj Close" in lvl0:
-                closes = data["Adj Close"]
-            else:
-                try:
-                    closes = data.xs("Close", axis=1, level=-1)
-                except Exception:
-                    return pd.DataFrame()
-            if isinstance(closes, pd.Series):
-                closes = closes.to_frame()
-            return closes
-        if "Close" in data.columns:
-            return pd.DataFrame({tickers[0]: data["Close"]})
-        if "Adj Close" in data.columns:
-            return pd.DataFrame({tickers[0]: data["Adj Close"]})
-        return pd.DataFrame()
-
-    # Batch first
-    try:
-        raw = yf.download(
-            tickers=tickers,
-            start=start_str,
-            end=end_str,
-            interval="1d",
-            group_by="column",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-            timeout=30,
-        )
-        closes = extract_close(raw)
-    except Exception as e:
-        closes = pd.DataFrame()
-        meta["note"] = f"Batch download failed: {e}"
-
-    # Per-ticker fallback (still Yahoo)
-    if closes.empty:
-        meta["mode"] = "per_ticker"
-        series = {}
-        for t in tickers:
+class EnhancedDataFetcher:
+    """Robust data fetcher with multiple strategies and fallbacks"""
+    
+    @staticmethod
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def fetch_with_retry(
+        tickers: List[str],
+        start: date,
+        end: date,
+        max_retries: int = 3,
+        parallel: bool = True
+    ) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
+        """Fetch data with multiple strategies and retry logic"""
+        
+        start_str = pd.to_datetime(start).strftime("%Y-%m-%d")
+        end_str = pd.to_datetime(end).strftime("%Y-%m-%d")
+        
+        metadata = {
+            "strategy": "unknown",
+            "attempts": 0,
+            "success": False,
+            "errors": []
+        }
+        
+        # Strategy 1: Batch download
+        for attempt in range(max_retries):
+            metadata["attempts"] += 1
             try:
-                d = yf.download(
-                    tickers=t,
+                data = yf.download(
+                    tickers=tickers,
                     start=start_str,
                     end=end_str,
                     interval="1d",
                     auto_adjust=True,
+                    group_by="column",
                     progress=False,
-                    threads=False,
-                    timeout=30,
+                    threads=True,
+                    timeout=30
                 )
-                if d is None or d.empty:
-                    continue
-                if "Close" in d.columns:
-                    series[t] = d["Close"]
-                elif "Adj Close" in d.columns:
-                    series[t] = d["Adj Close"]
-            except Exception:
+                
+                if data is not None and not data.empty:
+                    closes = EnhancedDataFetcher._extract_closes(data, tickers)
+                    if not closes.empty:
+                        metadata["strategy"] = "batch"
+                        metadata["success"] = True
+                        closes = EnhancedDataFetcher._clean_index(closes)
+                        dropped = [t for t in tickers if t not in closes.columns]
+                        return closes, dropped, metadata
+                        
+            except Exception as e:
+                metadata["errors"].append(f"Batch attempt {attempt + 1}: {str(e)}")
+                time.sleep(2 ** attempt)  # Exponential backoff
+        
+        # Strategy 2: Parallel download if batch fails
+        if parallel and len(tickers) > 1:
+            try:
+                closes = EnhancedDataFetcher._fetch_parallel(tickers, start_str, end_str)
+                if not closes.empty:
+                    metadata["strategy"] = "parallel"
+                    metadata["success"] = True
+                    closes = EnhancedDataFetcher._clean_index(closes)
+                    dropped = [t for t in tickers if t not in closes.columns]
+                    return closes, dropped, metadata
+            except Exception as e:
+                metadata["errors"].append(f"Parallel fetch: {str(e)}")
+        
+        # Strategy 3: Sequential download as last resort
+        closes = EnhancedDataFetcher._fetch_sequential(tickers, start_str, end_str)
+        if not closes.empty:
+            metadata["strategy"] = "sequential"
+            metadata["success"] = True
+            closes = EnhancedDataFetcher._clean_index(closes)
+            dropped = [t for t in tickers if t not in closes.columns]
+            return closes, dropped, metadata
+        
+        return pd.DataFrame(), tickers, metadata
+    
+    @staticmethod
+    def _extract_closes(data: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
+        """Extract close prices from various Yahoo Finance return formats"""
+        if data is None or data.empty:
+            return pd.DataFrame()
+        
+        if isinstance(data.columns, pd.MultiIndex):
+            # Multi-index case (multiple tickers)
+            for price_type in ["Close", "Adj Close"]:
+                if price_type in data.columns.get_level_values(0):
+                    closes = data[price_type]
+                    if isinstance(closes, pd.Series):
+                        closes = closes.to_frame()
+                    return closes
+        else:
+            # Single ticker case
+            if "Close" in data.columns:
+                return pd.DataFrame({tickers[0]: data["Close"]})
+            elif "Adj Close" in data.columns:
+                return pd.DataFrame({tickers[0]: data["Adj Close"]})
+        
+        return pd.DataFrame()
+    
+    @staticmethod
+    def _fetch_parallel(tickers: List[str], start: str, end: str, max_workers: int = 5) -> pd.DataFrame:
+        """Parallel fetch for better performance"""
+        
+        def fetch_single(ticker):
+            try:
+                ticker_data = yf.download(
+                    tickers=ticker,
+                    start=start,
+                    end=end,
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False
+                )
+                if ticker_data is not None and not ticker_data.empty:
+                    if "Close" in ticker_data.columns:
+                        return ticker, ticker_data["Close"]
+                    elif "Adj Close" in ticker_data.columns:
+                        return ticker, ticker_data["Adj Close"]
+            except:
+                pass
+            return ticker, None
+        
+        results = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ticker = {executor.submit(fetch_single, t): t for t in tickers}
+            for future in concurrent.futures.as_completed(future_to_ticker):
+                ticker, series = future.result()
+                if series is not None:
+                    results[ticker] = series
+        
+        if results:
+            return pd.DataFrame(results)
+        return pd.DataFrame()
+    
+    @staticmethod
+    def _fetch_sequential(tickers: List[str], start: str, end: str) -> pd.DataFrame:
+        """Sequential fetch as last resort"""
+        results = {}
+        for ticker in tickers:
+            try:
+                ticker_data = yf.download(
+                    tickers=ticker,
+                    start=start,
+                    end=end,
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False
+                )
+                if ticker_data is not None and not ticker_data.empty:
+                    if "Close" in ticker_data.columns:
+                        results[ticker] = ticker_data["Close"]
+            except:
                 continue
-        closes = pd.DataFrame(series)
+            time.sleep(0.2)  # Rate limiting
+        
+        return pd.DataFrame(results) if results else pd.DataFrame()
+    
+    @staticmethod
+    def _clean_index(df: pd.DataFrame) -> pd.DataFrame:
+        """Clean datetime index"""
+        if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+            df = df.copy()
+            df.index = df.index.tz_localize(None)
+        return df
 
-    closes = closes.sort_index()
-    closes = _tz_strip_index(closes)
-    closes = _coerce_numeric_df(closes)
-
-    dropped = [t for t in tickers if t not in closes.columns or closes[t].dropna().empty]
-    closes = closes.drop(columns=dropped, errors="ignore")
-    return closes, dropped, meta
-
-def clean_prices_forward_fill(
-    prices: pd.DataFrame,
-    min_obs: int,
-    max_missing_frac: float,
-    ffill_limit: int,
-) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
-    info = {"min_obs": min_obs, "max_missing_frac": max_missing_frac, "ffill_limit": ffill_limit}
-    if prices is None or prices.empty:
-        return pd.DataFrame(), [], info
-
-    p = prices.copy()
-
-    # Missing fraction BEFORE ffill (for reporting)
-    pre_miss = p.isna().mean()
-
-    # Forward-fill only
-    p = p.ffill(limit=ffill_limit)
-
-    # Drop all-NaN columns
-    p = p.dropna(axis=1, how="all")
-
-    dropped = []
-
-    # Drop assets that were too missing originally
-    bad_missing = pre_miss[pre_miss > max_missing_frac].index.tolist()
-    dropped.extend(bad_missing)
-    p = p.drop(columns=bad_missing, errors="ignore")
-
-    # Drop assets with too few observations after ffill
-    counts = p.count()
-    bad_counts = counts[counts < min_obs].index.tolist()
-    dropped.extend(bad_counts)
-    p = p.drop(columns=bad_counts, errors="ignore")
-
-    # Strict intersection: keep rows where all assets have prices
-    p = p.dropna(how="any")
-
-    info.update(
-        {
-            "start_effective": str(p.index.min()) if not p.empty else None,
-            "end_effective": str(p.index.max()) if not p.empty else None,
-            "n_assets": int(p.shape[1]),
-            "n_days": int(p.shape[0]),
-        }
-    )
-    return p, sorted(list(set(dropped))), info
-
-def returns_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
-    r = prices.pct_change().dropna(how="any")
-    return _coerce_numeric_df(r)
 
 # ------------------------------------------------------------
-# Risk analytics
+# Advanced Risk Analytics Class
 # ------------------------------------------------------------
 @dataclass
-class RiskResults:
+class AdvancedRiskMetrics:
+    """Comprehensive risk metrics calculation"""
+    
+    @staticmethod
+    def calculate_drawdowns(returns: pd.Series) -> pd.DataFrame:
+        """Calculate drawdown metrics including underwater period"""
+        wealth = (1 + returns).cumprod()
+        peak = wealth.cummax()
+        drawdown = (wealth - peak) / peak
+        
+        # Find drawdown periods
+        is_drawdown = drawdown < 0
+        drawdown_start = None
+        drawdown_periods = []
+        
+        for i, val in enumerate(is_drawdown):
+            if val and drawdown_start is None:
+                drawdown_start = i
+            elif not val and drawdown_start is not None:
+                drawdown_periods.append((drawdown_start, i))
+                drawdown_start = None
+        
+        # Calculate max drawdown duration
+        if drawdown_periods:
+            max_duration = max(end - start for start, end in drawdown_periods)
+        else:
+            max_duration = 0
+        
+        return pd.DataFrame({
+            'Drawdown': drawdown,
+            'Wealth_Index': wealth,
+            'Peak': peak,
+            'Max_Drawdown': drawdown.min(),
+            'Max_Duration_Days': max_duration
+        })
+    
+    @staticmethod
+    def tail_risk_metrics(returns: pd.Series) -> Dict[str, float]:
+        """Calculate comprehensive tail risk measures"""
+        sorted_returns = returns.sort_values()
+        
+        metrics = {}
+        
+        # VaR at different confidence levels
+        for conf in [0.95, 0.99]:
+            alpha = 1 - conf
+            var = sorted_returns.quantile(alpha)
+            cvar = sorted_returns[sorted_returns <= var].mean()
+            
+            metrics[f'VaR_{int(conf*100)}'] = var
+            metrics[f'CVaR_{int(conf*100)}'] = cvar
+        
+        # Expected Shortfall (ES) at different levels
+        for conf in [0.95, 0.99]:
+            alpha = 1 - conf
+            var = sorted_returns.quantile(alpha)
+            es = sorted_returns[sorted_returns <= var].mean()
+            metrics[f'ES_{int(conf*100)}'] = es
+        
+        # Tail Ratio (right tail / left tail)
+        right_tail = sorted_returns.quantile(0.95)
+        left_tail = abs(sorted_returns.quantile(0.05))
+        metrics['Tail_Ratio'] = right_tail / left_tail if left_tail != 0 else np.nan
+        
+        # Pain Index and Ulcer Index
+        wealth = (1 + returns).cumprod()
+        drawdown = wealth / wealth.cummax() - 1
+        metrics['Pain_Index'] = abs(drawdown).mean() * 100
+        metrics['Ulcer_Index'] = np.sqrt((drawdown ** 2).mean()) * 100
+        
+        # Distribution metrics
+        metrics['Skewness'] = returns.skew()
+        metrics['Kurtosis'] = returns.kurtosis()
+        metrics['Jarque_Bera'] = stats.jarque_bera(returns.dropna())[0]
+        
+        return metrics
+    
+    @staticmethod
+    def rolling_risk_metrics(returns: pd.Series, windows: List[int] = [21, 63, 252]) -> pd.DataFrame:
+        """Calculate rolling risk metrics for multiple windows"""
+        results = {}
+        
+        for window in windows:
+            rolling_vol = returns.rolling(window).std() * np.sqrt(252)
+            rolling_sharpe = returns.rolling(window).mean() / returns.rolling(window).std() * np.sqrt(252)
+            rolling_var = returns.rolling(window).quantile(0.05)
+            rolling_skew = returns.rolling(window).skew()
+            
+            results[f'Vol_{window}d'] = rolling_vol
+            results[f'Sharpe_{window}d'] = rolling_sharpe
+            results[f'VaR95_{window}d'] = rolling_var
+            results[f'Skew_{window}d'] = rolling_skew
+        
+        return pd.DataFrame(results)
+    
+    @staticmethod
+    def stability_metrics(returns: pd.Series) -> Dict[str, float]:
+        """Calculate strategy stability metrics"""
+        # Rolling Sharpe stability
+        rolling_sharpe = returns.rolling(252).mean() / returns.rolling(252).std() * np.sqrt(252)
+        sharpe_std = rolling_sharpe.std()
+        sharpe_mean = rolling_sharpe.mean()
+        
+        # Hit rate (percentage of positive days)
+        hit_rate = (returns > 0).mean()
+        
+        # Gain to Pain ratio
+        avg_gain = returns[returns > 0].mean() if any(returns > 0) else 0
+        avg_loss = abs(returns[returns < 0].mean()) if any(returns < 0) else 1
+        gain_pain_ratio = avg_gain / avg_loss if avg_loss > 0 else np.nan
+        
+        # Calmar ratio (CAGR / Max Drawdown)
+        cagr = (1 + returns).prod() ** (252 / len(returns)) - 1
+        max_dd = AdvancedRiskMetrics.calculate_drawdowns(returns)['Max_Drawdown'].iloc[0]
+        calmar_ratio = cagr / abs(max_dd) if max_dd != 0 else np.nan
+        
+        return {
+            'Sharpe_Stability': sharpe_std / sharpe_mean if sharpe_mean != 0 else np.nan,
+            'Hit_Rate': hit_rate,
+            'Gain_Pain_Ratio': gain_pain_ratio,
+            'Calmar_Ratio': calmar_ratio,
+            'Avg_Gain': avg_gain,
+            'Avg_Loss': avg_loss
+        }
+
+
+# ------------------------------------------------------------
+# Monte Carlo Simulation for Stress Testing
+# ------------------------------------------------------------
+class MonteCarloSimulator:
+    """Monte Carlo simulation for portfolio stress testing"""
+    
+    @staticmethod
+    def simulate_returns(
+        returns: pd.DataFrame,
+        weights: np.ndarray,
+        n_simulations: int = 10000,
+        horizon_days: int = 252
+    ) -> Dict[str, Any]:
+        """Run Monte Carlo simulation for portfolio returns"""
+        
+        # Calculate parameters
+        mu = returns.mean() * 252
+        sigma = returns.cov() * 252
+        
+        # Generate correlated random returns
+        n_assets = len(returns.columns)
+        simulated_returns = np.random.multivariate_normal(
+            mean=mu,
+            cov=sigma,
+            size=(n_simulations, horizon_days)
+        )
+        
+        # Calculate portfolio returns for each simulation
+        portfolio_returns = simulated_returns @ weights
+        
+        # Calculate cumulative returns
+        cumulative_returns = np.cumprod(1 + portfolio_returns, axis=1)
+        
+        # Calculate metrics
+        final_values = cumulative_returns[:, -1]
+        
+        results = {
+            'final_values': final_values,
+            'mean_final': np.mean(final_values),
+            'median_final': np.median(final_values),
+            'std_final': np.std(final_values),
+            'var_95': np.percentile(final_values, 5),
+            'var_99': np.percentile(final_values, 1),
+            'cvar_95': np.mean(final_values[final_values <= np.percentile(final_values, 5)]),
+            'probability_loss': np.mean(final_values < 1) * 100,
+            'probability_double': np.mean(final_values > 2) * 100,
+            'all_simulations': cumulative_returns
+        }
+        
+        return results
+    
+    @staticmethod
+    def plot_simulations(sim_results: Dict[str, Any], n_show: int = 100) -> go.Figure:
+        """Plot Monte Carlo simulation results"""
+        
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=('Simulated Paths', 'Distribution of Final Values',
+                           'Value at Risk (VaR)', 'Probability Distribution'),
+            specs=[[{'secondary_y': False}, {'secondary_y': False}],
+                   [{'secondary_y': False}, {'secondary_y': False}]]
+        )
+        
+        # Simulated paths
+        for i in range(min(n_show, len(sim_results['all_simulations']))):
+            fig.add_trace(
+                go.Scatter(
+                    y=sim_results['all_simulations'][i],
+                    mode='lines',
+                    line=dict(width=0.5, color='rgba(100,100,255,0.2)'),
+                    showlegend=False
+                ),
+                row=1, col=1
+            )
+        
+        # Distribution of final values
+        fig.add_trace(
+            go.Histogram(x=sim_results['final_values'], nbinsx=50, name='Distribution'),
+            row=1, col=2
+        )
+        
+        # VaR visualization
+        fig.add_trace(
+            go.Box(y=sim_results['final_values'], name='Final Values'),
+            row=2, col=1
+        )
+        
+        # Probability distribution
+        fig.add_trace(
+            go.Violin(y=sim_results['final_values'], name='Distribution', box_visible=True),
+            row=2, col=2
+        )
+        
+        fig.update_layout(
+            height=800,
+            title_text="Monte Carlo Simulation Results",
+            showlegend=False
+        )
+        
+        return fig
+
+
+# ------------------------------------------------------------
+# Enhanced Risk Engine with Advanced Metrics
+# ------------------------------------------------------------
+@dataclass
+class EnhancedRiskResults:
     risk_table: pd.DataFrame
     portfolio_metrics: Dict[str, Any]
     cov_annual: pd.DataFrame
     port_returns: pd.Series
+    advanced_metrics: Dict[str, Any]
+    drawdown_analysis: pd.DataFrame
+    tail_metrics: Dict[str, float]
 
-class RiskEngine:
+class EnhancedRiskEngine:
+    """Enhanced risk engine with comprehensive metrics"""
+    
     @staticmethod
     def portfolio_vol(cov_annual: np.ndarray, w: np.ndarray) -> float:
         return float(np.sqrt(np.maximum(w @ cov_annual @ w, 0.0)))
-
+    
     @staticmethod
     def risk_contributions(cov_annual: pd.DataFrame, w: np.ndarray, tickers: List[str]) -> pd.DataFrame:
         cov = cov_annual.values
-        vol = RiskEngine.portfolio_vol(cov, w)
+        vol = EnhancedRiskEngine.portfolio_vol(cov, w)
         if vol <= 0:
             vol = 1e-12
+        
         mrc = (cov @ w) / vol
         crc = w * mrc
         pct = (crc / vol) * 100.0
         indiv_vol = np.sqrt(np.diag(cov))
+        
         df = pd.DataFrame({
             "Symbol": tickers,
-            "Sector": [SECTOR_MAP.get(t, "Other") for t in tickers],
+            "Company": [COMPANY_METADATA.get(t, {}).get("name", t) for t in tickers],
+            "Sector": [COMPANY_METADATA.get(t, {}).get("sector", "Other") for t in tickers],
+            "Market_Cap": [COMPANY_METADATA.get(t, {}).get("market_cap", "Mid") for t in tickers],
             "Weight": w,
             "Individual_Volatility": indiv_vol,
             "Marginal_Risk_Contribution": mrc,
             "Component_Risk": crc,
-            "Risk_Contribution_%": pct
+            "Risk_Contribution_%": pct,
+            "Risk_Weight_Ratio": pct / (w * 100) if any(w > 0) else 0
         }).sort_values("Risk_Contribution_%", ascending=False).reset_index(drop=True)
+        
         df["Risk_Rank"] = np.arange(1, len(df) + 1)
         return df
-
+    
     @staticmethod
-    def tail_var_es(returns: pd.Series, alpha: float) -> Dict[str, float]:
-        var = float(returns.quantile(alpha))
-        es = float(returns[returns <= var].mean()) if (returns <= var).any() else float("nan")
-        return {"VaR": var, "ES": es}
-
-    @staticmethod
-    def compute(returns: pd.DataFrame, weights: np.ndarray) -> RiskResults:
+    def compute(returns: pd.DataFrame, weights: np.ndarray) -> EnhancedRiskResults:
         tickers = returns.columns.tolist()
         cov_annual = returns.cov() * 252.0
         cov_annual = cov_annual.fillna(0.0)
         port_returns = (returns * weights).sum(axis=1)
-
+        
         port_var = float(weights @ cov_annual.values @ weights)
         port_vol = float(np.sqrt(np.maximum(port_var, 0.0)))
-
+        
         indiv_vol = np.sqrt(np.diag(cov_annual.values))
         weighted_avg_vol = float(np.sum(weights * indiv_vol)) if len(indiv_vol) else float("nan")
         diversification_ratio = float(weighted_avg_vol / port_vol) if port_vol > 0 else float("nan")
-
-        risk_df = RiskEngine.risk_contributions(cov_annual, weights, tickers)
-
-        tail95 = RiskEngine.tail_var_es(port_returns, 0.05)
-        tail99 = RiskEngine.tail_var_es(port_returns, 0.01)
-
+        
+        risk_df = EnhancedRiskEngine.risk_contributions(cov_annual, weights, tickers)
+        
+        # Advanced metrics
+        advanced = AdvancedRiskMetrics()
+        drawdown_analysis = advanced.calculate_drawdowns(port_returns)
+        tail_metrics = advanced.tail_risk_metrics(port_returns)
+        stability_metrics = advanced.stability_metrics(port_returns)
+        rolling_metrics = advanced.rolling_risk_metrics(port_returns)
+        
+        # Calculate returns metrics
+        total_return = (1 + port_returns).prod() - 1
+        cagr = (1 + total_return) ** (252 / len(port_returns)) - 1
+        
         portfolio_metrics = {
             "volatility": port_vol,
             "variance": port_var,
+            "total_return": total_return,
+            "cagr": cagr,
             "n_assets": len(tickers),
             "diversification_ratio": diversification_ratio,
             "max_risk_contrib": float(risk_df.iloc[0]["Risk_Contribution_%"]) if len(risk_df) else float("nan"),
             "max_risk_asset": str(risk_df.iloc[0]["Symbol"]) if len(risk_df) else "",
-            "VaR_95_1d": tail95["VaR"],
-            "ES_95_1d": tail95["ES"],
-            "VaR_99_1d": tail99["VaR"],
-            "ES_99_1d": tail99["ES"],
+            "max_drawdown": float(drawdown_analysis['Max_Drawdown'].iloc[0]),
+            "max_drawdown_duration": int(drawdown_analysis['Max_Duration_Days'].iloc[0]),
         }
-        return RiskResults(risk_table=risk_df, portfolio_metrics=portfolio_metrics,
-                           cov_annual=cov_annual, port_returns=port_returns)
+        
+        # Add tail metrics to portfolio metrics
+        portfolio_metrics.update(tail_metrics)
+        portfolio_metrics.update(stability_metrics)
+        
+        return EnhancedRiskResults(
+            risk_table=risk_df,
+            portfolio_metrics=portfolio_metrics,
+            cov_annual=cov_annual,
+            port_returns=port_returns,
+            advanced_metrics=rolling_metrics.to_dict() if not rolling_metrics.empty else {},
+            drawdown_analysis=drawdown_analysis,
+            tail_metrics=tail_metrics
+        )
 
-# Rolling RC%
-@st.cache_data(ttl=3600, show_spinner=False)
-def rolling_risk_contributions(returns: pd.DataFrame, weights: Tuple[float, ...], window: int) -> pd.DataFrame:
-    w = np.array(weights, dtype=float)
-    tickers = returns.columns.tolist()
-    if len(returns) < window + 5:
-        return pd.DataFrame()
-    out = []
-    for i in range(window, len(returns) + 1):
-        sub = returns.iloc[i - window:i]
-        cov = sub.cov().values * 252.0
-        port_var = float(w @ cov @ w)
-        port_vol = float(np.sqrt(np.maximum(port_var, 0.0)))
-        if port_vol <= 0:
-            continue
-        mrc = (cov @ w) / port_vol
-        crc = w * mrc
-        pct = (crc / port_vol) * 100.0
-        out.append(pct)
-    idx = returns.index[window - 1:]
-    rr = pd.DataFrame(out, index=idx[:len(out)], columns=tickers)
-    rr = rr.replace([np.inf, -np.inf], np.nan).dropna(how="all")
-    return rr
-
-# Active risk contributions
-def active_risk_contributions(asset_returns: pd.DataFrame, weights: np.ndarray, benchmark_returns: pd.Series) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    common = asset_returns.index.intersection(benchmark_returns.index)
-    R = asset_returns.loc[common].copy()
-    b = benchmark_returns.loc[common].copy()
-    port = (R * weights).sum(axis=1)
-    active = port - b
-
-    cov = pd.concat([R, active.rename("ACTIVE")], axis=1).cov() * 252.0
-    cov_assets_active = cov.loc[R.columns, "ACTIVE"].values
-
-    active_var = float(active.var() * 252.0)
-    active_vol = float(np.sqrt(np.maximum(active_var, 0.0)))
-    if active_vol <= 0:
-        active_vol = 1e-12
-
-    mrc = cov_assets_active / active_vol
-    crc = weights * mrc
-    pct = (crc / active_vol) * 100.0
-
-    df = pd.DataFrame({"Symbol": R.columns, "Active_MRC": mrc, "Active_CRC": crc, "Active_Risk_%": pct})
-    df = df.sort_values("Active_Risk_%", ascending=False).reset_index(drop=True)
-
-    meta = {
-        "tracking_error": active_vol,
-        "active_mean": float(active.mean() * 252.0),
-        "information_ratio": (float(active.mean() * 252.0) / active_vol) if active_vol > 0 else np.nan,
-    }
-    return df, meta
-
-# Stress betas (FX + Rate proxy)
-def estimate_factor_betas(asset_returns: pd.DataFrame, fx_returns: pd.Series, rate_changes: pd.Series, min_obs: int = 100) -> pd.DataFrame:
-    common = asset_returns.index.intersection(fx_returns.index).intersection(rate_changes.index)
-    R = asset_returns.loc[common]
-    FX = fx_returns.loc[common]
-    RT = rate_changes.loc[common]
-
-    rows = []
-    for t in R.columns:
-        y = R[t].dropna()
-        X = pd.concat([FX.rename("FX"), RT.rename("RATE")], axis=1).loc[y.index].dropna()
-        y = y.loc[X.index]
-        if len(y) < min_obs:
-            rows.append((t, np.nan, np.nan, len(y)))
-            continue
-        Xmat = np.column_stack([np.ones(len(X)), X["FX"].values, X["RATE"].values])
-        coef, *_ = np.linalg.lstsq(Xmat, y.values, rcond=None)
-        rows.append((t, float(coef[1]), float(coef[2]), int(len(y))))
-    return pd.DataFrame(rows, columns=["Symbol", "Beta_FX", "Beta_Rate", "Obs"])
-
-def stress_scenario_impact(weights: np.ndarray, betas: pd.DataFrame, fx_shock: float, rate_shock_bp: float) -> Dict[str, Any]:
-    b = betas.set_index("Symbol")
-    # bp -> yield decimal (100bp = 0.01)
-    rate_shock_dec = rate_shock_bp / 10000.0
-    beta_fx = b["Beta_FX"].fillna(0.0).values
-    beta_rt = b["Beta_Rate"].fillna(0.0).values
-    shock_vec = beta_fx * fx_shock + beta_rt * rate_shock_dec
-    impact = float(np.sum(weights * shock_vec))
-    contrib = weights * shock_vec
-    df = pd.DataFrame({"Symbol": b.index, "Shock_Return": shock_vec, "Contribution": contrib}).sort_values("Contribution", ascending=False)
-    return {"portfolio_impact": impact, "details": df, "fx_shock": fx_shock, "rate_shock_bp": rate_shock_bp}
 
 # ------------------------------------------------------------
-# Optimization
+# Enhanced Visualizations
 # ------------------------------------------------------------
-def clip_and_renormalize(w: np.ndarray, max_w: float) -> np.ndarray:
-    w = np.clip(w, 0.0, max_w)
-    s = w.sum()
-    return w / s if s > 0 else np.ones_like(w) / len(w)
-
-def apply_sector_caps_post(w: np.ndarray, tickers: List[str], sector_caps: Dict[str, float]) -> np.ndarray:
-    if not sector_caps:
-        return w
-    w = w.copy()
-    for _ in range(10):
-        sector_sums = {}
-        for i, t in enumerate(tickers):
-            sec = SECTOR_MAP.get(t, "Other")
-            sector_sums[sec] = sector_sums.get(sec, 0.0) + w[i]
-        violated = [(sec, sector_sums[sec], cap) for sec, cap in sector_caps.items() if sector_sums.get(sec, 0.0) > cap + 1e-9]
-        if not violated:
-            break
-        for sec, actual, cap in violated:
-            idx = [i for i, t in enumerate(tickers) if SECTOR_MAP.get(t, "Other") == sec]
-            if not idx or actual <= 0:
-                continue
-            scale = cap / actual
-            w[idx] *= scale
-            leftover = 1.0 - w.sum()
-            other_idx = [i for i in range(len(tickers)) if i not in idx]
-            if other_idx:
-                base = w[other_idx].sum()
-                if base > 0:
-                    w[other_idx] += (w[other_idx] / base) * leftover
-        if w.sum() > 0:
-            w /= w.sum()
-    return w
-
-def optimize_portfolio(prices: pd.DataFrame, returns: pd.DataFrame, method: str, max_weight: float, sector_caps: Dict[str, float]) -> Tuple[np.ndarray, str]:
-    tickers = returns.columns.tolist()
-    n = len(tickers)
-
-    if method == "Equal Weight":
-        return np.ones(n) / n, ""
-
-    if method == "Risk Parity (SciPy)":
-        cov = returns.cov().values * 252.0
-
-        def obj(w):
-            w = clip_and_renormalize(w, max_weight)
-            port_var = float(w @ cov @ w)
-            port_vol = math.sqrt(max(port_var, 1e-18))
-            mrc = (cov @ w) / port_vol
-            rc = w * mrc
-            target = port_vol / n
-            return float(np.sum((rc - target) ** 2))
-
-        x0 = np.ones(n) / n
-        cons = {"type": "eq", "fun": lambda x: np.sum(x) - 1.0}
-        bnds = [(0.0, max_weight) for _ in range(n)]
-        res = minimize(obj, x0, method="SLSQP", bounds=bnds, constraints=cons, options={"ftol": 1e-10, "maxiter": 2000})
-        w = res.x if res.success else x0
-        w = clip_and_renormalize(w, max_weight)
-        w = apply_sector_caps_post(w, tickers, sector_caps)
-        return w, "Risk parity via SciPy (sector caps post-processed)."
-
-    # PyPortfolioOpt routes
-    if not PYPFOPT_AVAILABLE:
-        return np.ones(n) / n, "PyPortfolioOpt missing; defaulted to equal weight."
-
-    mu = expected_returns.mean_historical_return(prices, frequency=252)
-    S = risk_models.CovarianceShrinkage(prices).ledoit_wolf()
-
-    try:
-        if method in ["Min Volatility", "Max Sharpe", "Efficient Return", "Efficient Risk", "Black-Litterman"]:
-            if method == "Black-Litterman":
-                market_caps = pd.Series(1.0, index=tickers)
-                bl = BlackLittermanModel(S, pi="market", market_caps=market_caps)
-                mu = bl.bl_returns()
-                S = bl.bl_cov()
-
+class EnhancedVisualizer:
+    """Enhanced visualization suite"""
+    
+    @staticmethod
+    def create_dashboard(
+        returns: pd.DataFrame,
+        weights: np.ndarray,
+        risk_results: EnhancedRiskResults,
+        benchmark_returns: Optional[pd.Series] = None
+    ) -> go.Figure:
+        """Create comprehensive risk dashboard"""
+        
+        port_returns = risk_results.port_returns
+        
+        fig = make_subplots(
+            rows=4, cols=3,
+            subplot_titles=(
+                'Cumulative Returns', 'Drawdown Analysis', 'Rolling Volatility',
+                'Risk Contribution', 'Monthly Returns Heatmap', 'Rolling Sharpe',
+                'Correlation Matrix', 'VaR Distribution', 'Risk Metrics',
+                'Sector Allocation', 'Top Holdings', 'Performance Summary'
+            ),
+            specs=[
+                [{'secondary_y': True}, {'secondary_y': False}, {'secondary_y': False}],
+                [{'secondary_y': False}, {'secondary_y': False}, {'secondary_y': False}],
+                [{'secondary_y': False}, {'secondary_y': False}, {'secondary_y': False}],
+                [{'secondary_y': False}, {'secondary_y': False}, {'type': 'table'}]
+            ],
+            vertical_spacing=0.08,
+            horizontal_spacing=0.1
+        )
+        
+        # 1. Cumulative Returns
+        cum_ret = (1 + port_returns).cumprod()
+        fig.add_trace(
+            go.Scatter(x=cum_ret.index, y=cum_ret.values, name='Portfolio', line=dict(color='blue', width=2)),
+            row=1, col=1
+        )
+        
+        if benchmark_returns is not None:
+            common_idx = cum_ret.index.intersection(benchmark_returns.index)
+            bench_cum = (1 + benchmark_returns[common_idx]).cumprod()
+            fig.add_trace(
+                go.Scatter(x=bench_cum.index, y=bench_cum.values, name='BIST100',
+                          line=dict(color='gray', width=1, dash='dash')),
+                row=1, col=1
+            )
+        
+        # 2. Drawdown Analysis
+        drawdown = risk_results.drawdown_analysis['Drawdown'] * 100
+        fig.add_trace(
+            go.Scatter(x=drawdown.index, y=drawdown.values, fill='tozeroy',
+                      name='Drawdown %', line=dict(color='red')),
+            row=1, col=2
+        )
+        
+        # Mark maximum drawdown
+        max_dd_idx = drawdown.idxmin()
+        fig.add_trace(
+            go.Scatter(x=[max_dd_idx], y=[drawdown.min()], mode='markers',
+                      marker=dict(size=10, color='darkred', symbol='x'),
+                      name=f'Max DD: {drawdown.min():.1f}%'),
+            row=1, col=2
+        )
+        
+        # 3. Rolling Volatility
+        roll_vol = port_returns.rolling(60).std() * np.sqrt(252) * 100
+        fig.add_trace(
+            go.Scatter(x=roll_vol.index, y=roll_vol.values, name='60d Rolling Vol %',
+                      line=dict(color='orange', width=2)),
+            row=1, col=3
+        )
+        
+        # 4. Risk Contribution
+        risk_df = risk_results.risk_table.nlargest(15, 'Risk_Contribution_%')
+        fig.add_trace(
+            go.Bar(
+                y=risk_df['Company'],
+                x=risk_df['Risk_Contribution_%'],
+                orientation='h',
+                name='Risk Contribution',
+                marker=dict(
+                    color=risk_df['Risk_Contribution_%'],
+                    colorscale='RdYlGn_r',
+                    showscale=True
+                )
+            ),
+            row=2, col=1
+        )
+        
+        # 5. Monthly Returns Heatmap
+        monthly_ret = port_returns.resample('M').apply(lambda x: (1 + x).prod() - 1) * 100
+        years = monthly_ret.index.year.unique()
+        months = range(1, 13)
+        
+        heatmap_data = []
+        for y in sorted(years):
+            year_data = []
+            for m in months:
+                val = monthly_ret[(monthly_ret.index.year == y) & (monthly_ret.index.month == m)]
+                year_data.append(val.iloc[0] if not val.empty else 0)
+            heatmap_data.append(year_data)
+        
+        fig.add_trace(
+            go.Heatmap(
+                z=heatmap_data,
+                x=[f'Month {m}' for m in months],
+                y=sorted(years),
+                colorscale='RdYlGn',
+                zmid=0,
+                showscale=False,
+                hovertemplate='Year: %{y}<br>Month: %{x}<br>Return: %{z:.1f}%<extra></extra>'
+            ),
+            row=2, col=2
+        )
+        
+        # 6. Rolling Sharpe
+        roll_sharpe = port_returns.rolling(252).mean() / port_returns.rolling(252).std() * np.sqrt(252)
+        fig.add_trace(
+            go.Scatter(x=roll_sharpe.index, y=roll_sharpe.values, name='1Y Rolling Sharpe',
+                      line=dict(color='purple', width=2)),
+            row=2, col=3
+        )
+        fig.add_hline(y=1, line_dash="dash", line_color="green", row=2, col=3,
+                     annotation_text="Good Sharpe")
+        
+        # 7. Correlation Matrix (Top 15 assets)
+        top_assets = risk_results.risk_table.nlargest(15, 'Weight')['Symbol'].tolist()
+        corr_matrix = returns[top_assets].corr()
+        
+        fig.add_trace(
+            go.Heatmap(
+                z=corr_matrix.values,
+                x=corr_matrix.columns,
+                y=corr_matrix.columns,
+                colorscale='RdBu',
+                zmid=0,
+                text=corr_matrix.values.round(2),
+                texttemplate='%{text}',
+                textfont={"size": 8},
+                showscale=False
+            ),
+            row=3, col=1
+        )
+        
+        # 8. VaR Distribution
+        var_95 = risk_results.tail_metrics.get('VaR_95', 0) * 100
+        var_99 = risk_results.tail_metrics.get('VaR_99', 0) * 100
+        
+        fig.add_trace(
+            go.Histogram(x=port_returns * 100, nbinsx=50, name='Returns Distribution',
+                        marker_color='lightblue'),
+            row=3, col=2
+        )
+        fig.add_vline(x=var_95, line_dash="dash", line_color="red", row=3, col=2,
+                     annotation_text=f"VaR95: {var_95:.1f}%")
+        fig.add_vline(x=var_99, line_dash="dash", line_color="darkred", row=3, col=2,
+                     annotation_text=f"VaR99: {var_99:.1f}%")
+        
+        # 9. Risk Metrics Summary
+        metrics_text = [
+            f"Volatility: {risk_results.portfolio_metrics['volatility']*100:.1f}%",
+            f"Total Return: {risk_results.portfolio_metrics['total_return']*100:.1f}%",
+            f"CAGR: {risk_results.portfolio_metrics['cagr']*100:.1f}%",
+            f"Sharpe: {risk_results.portfolio_metrics.get('Sharpe_Ratio', 0):.2f}",
+            f"Max DD: {risk_results.portfolio_metrics['max_drawdown']*100:.1f}%",
+            f"Div Ratio: {risk_results.portfolio_metrics['diversification_ratio']:.2f}",
+            f"VaR95: {risk_results.tail_metrics.get('VaR_95', 0)*100:.1f}%",
+            f"CVaR95: {risk_results.tail_metrics.get('CVaR_95', 0)*100:.1f}%"
+        ]
+        
+        fig.add_trace(
+            go.Table(
+                header=dict(values=['Metric', 'Value']),
+                cells=dict(values=[
+                    [m.split(':')[0] for m in metrics_text],
+                    [m.split(':')[1].strip() for m in metrics_text]
+                ])
+            ),
+            row=3, col=3
+        )
+        
+        # 10. Sector Allocation
+        sector_data = risk_results.risk_table.groupby('Sector')['Weight'].sum() * 100
+        fig.add_trace(
+            go.Pie(
+                labels=sector_data.index,
+                values=sector_data.values,
+                hole=0.3,
+                textinfo='label+percent',
+                showlegend=False
+            ),
+            row=4, col=1
+        )
+        
+        # 11. Top Holdings
+        top_holdings = risk_results.risk_table.nlargest(5, 'Weight')[['Company', 'Weight']]
+        fig.add_trace(
+            go.Bar(
+                x=top_holdings['Weight'] * 100,
+                y=top_holdings['Company'],
+                orientation='h',
+                marker_color='green'
+            ),
+            row=4, col=2
+        )
+        
+        # 12. Performance Summary Table
+        perf_summary = pd.DataFrame({
+            'Metric': ['Alpha', 'Beta', 'Info Ratio', 'Tracking Error'],
+            'Value': ['N/A', 'N/A', 'N/A', 'N/A']
+        })
+        
+        fig.add_trace(
+            go.Table(
+                header=dict(values=['Metric', 'Value']),
+                cells=dict(values=[perf_summary['Metric'], perf_summary['Value']])
+            ),
+            row=4, col=3
+        )
+        
+        # Update layout
+        fig.update_layout(
+            height=1600,
+            title_text="BIST Advanced Risk Dashboard",
+            title_font_size=24,
+            showlegend=False,
+            template='plotly_white'
+        )
+        
+        return fig
+    
+    @staticmethod
+    def plot_efficient_frontier(
+        returns: pd.DataFrame,
+        risk_free_rate: float = 0.15
+    ) -> go.Figure:
+        """Plot efficient frontier with optimal portfolios"""
+        
+        if not PYPFOPT_AVAILABLE:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="PyPortfolioOpt not installed. Install for efficient frontier visualization.",
+                showarrow=False,
+                font=dict(size=14)
+            )
+            return fig
+        
+        try:
+            mu = expected_returns.mean_historical_return(returns)
+            S = risk_models.CovarianceShrinkage(returns).ledoit_wolf()
+            
+            # Generate efficient frontier
             ef = EfficientFrontier(mu, S)
-            ef.add_constraint(lambda w: w >= 0)
-            ef.add_constraint(lambda w: w <= max_weight)
+            
+            # Get frontier points
+            target_returns = np.linspace(mu.min(), mu.max() * 1.5, 50)
+            volatilities = []
+            
+            for target in target_returns:
+                try:
+                    ef = EfficientFrontier(mu, S)
+                    ef.efficient_return(target)
+                    volatilities.append(ef.portfolio_performance()[1])
+                except:
+                    volatilities.append(np.nan)
+            
+            # Get optimal portfolios
+            ef = EfficientFrontier(mu, S)
+            ef.add_constraint(lambda x: x >= 0)
+            
+            # Max Sharpe
+            ef.max_sharpe(risk_free_rate=risk_free_rate)
+            max_sharpe_ret, max_sharpe_vol, max_sharpe_sr = ef.portfolio_performance()
+            
+            # Min Volatility
+            ef.min_volatility()
+            min_vol_ret, min_vol_vol, min_vol_sr = ef.portfolio_performance()
+            
+            # Create figure
+            fig = go.Figure()
+            
+            # Efficient frontier
+            fig.add_trace(go.Scatter(
+                x=volatilities,
+                y=target_returns,
+                mode='lines',
+                name='Efficient Frontier',
+                line=dict(color='blue', width=2)
+            ))
+            
+            # Max Sharpe portfolio
+            fig.add_trace(go.Scatter(
+                x=[max_sharpe_vol],
+                y=[max_sharpe_ret],
+                mode='markers+text',
+                name='Max Sharpe',
+                marker=dict(size=15, color='red', symbol='star'),
+                text=['Max Sharpe'],
+                textposition='top center'
+            ))
+            
+            # Min Volatility portfolio
+            fig.add_trace(go.Scatter(
+                x=[min_vol_vol],
+                y=[min_vol_ret],
+                mode='markers+text',
+                name='Min Volatility',
+                marker=dict(size=15, color='green', symbol='diamond'),
+                text=['Min Vol'],
+                textposition='bottom center'
+            ))
+            
+            # Individual assets
+            fig.add_trace(go.Scatter(
+                x=np.sqrt(np.diag(S)),
+                y=mu,
+                mode='markers+text',
+                name='Individual Assets',
+                marker=dict(size=8, color='gray'),
+                text=returns.columns,
+                textposition='top center',
+                textfont=dict(size=8)
+            ))
+            
+            fig.update_layout(
+                title='Efficient Frontier - BIST Portfolio',
+                xaxis_title='Annualized Volatility',
+                yaxis_title='Annualized Return',
+                height=600,
+                template='plotly_white',
+                showlegend=True
+            )
+            
+            return fig
+            
+        except Exception as e:
+            fig = go.Figure()
+            fig.add_annotation(
+                text=f"Error generating efficient frontier: {str(e)}",
+                showarrow=False,
+                font=dict(size=12)
+            )
+            return fig
 
-            # sector caps linear constraints
-            for sec, cap in sector_caps.items():
-                idx = [i for i, t in enumerate(tickers) if SECTOR_MAP.get(t, "Other") == sec]
-                if idx:
-                    ef.add_constraint(lambda w, idx=idx, cap=cap: w[idx].sum() <= cap)
-
-            if method == "Min Volatility":
-                ef.min_volatility()
-            elif method == "Efficient Return":
-                ef.efficient_return(float(np.nanmedian(mu.values)))
-            elif method == "Efficient Risk":
-                asset_vol = np.sqrt(np.diag(S.values))
-                ef.efficient_risk(float(np.nanmedian(asset_vol)))
-            else:
-                ef.max_sharpe(risk_free_rate=0.0)
-
-            wd = ef.clean_weights()
-            w = np.array([wd.get(t, 0.0) for t in tickers], dtype=float)
-            w = w / w.sum() if w.sum() > 0 else np.ones(n) / n
-            return w, ""
-
-        if method == "HRP":
-            hrp = HRPOpt(returns.T)
-            hrp.optimize()
-            wd = hrp.clean_weights()
-            w = np.array([wd.get(t, 0.0) for t in tickers], dtype=float)
-            w = clip_and_renormalize(w, max_weight)
-            w = apply_sector_caps_post(w, tickers, sector_caps)
-            return w, "HRP (caps post-processed)."
-
-        if method == "CLA":
-            cla = CLA(mu, S)
-            cla.min_volatility()
-            wd = cla.clean_weights()
-            w = np.array([wd.get(t, 0.0) for t in tickers], dtype=float)
-            w = clip_and_renormalize(w, max_weight)
-            w = apply_sector_caps_post(w, tickers, sector_caps)
-            return w, "CLA (caps post-processed)."
-
-    except Exception as e:
-        return np.ones(n) / n, f"Optimization error, fallback to equal weight: {e}"
-
-    return np.ones(n) / n, "Unknown method; defaulted to equal weight."
 
 # ------------------------------------------------------------
-# App
+# Main Application
 # ------------------------------------------------------------
 def main():
+    # Header
     st.markdown('<div class="main-header">📊 Advanced BIST Risk Budgeting System</div>', unsafe_allow_html=True)
+    
+    # Data policy notice
     st.markdown(
         """
         <div class="note-box">
-        <b>Data policy:</b> This app fetches <b>prices only from Yahoo Finance</b> via <code>yfinance</code>.
-        If a ticker has missing days, the app applies <b>forward-fill only</b> (limited) and then enforces strict date alignment.
-        <br/><span class="small-muted">No synthetic series is generated. If Yahoo returns no usable history, the ticker is dropped and reported.</span>
+        <b>📡 Data Policy:</b> This app fetches prices exclusively from <b>Yahoo Finance</b> via <code>yfinance</code>.
+        Missing data is handled with <b>forward-fill only</b> (limited) followed by strict date alignment.
+        <br/><span class="small-muted">No synthetic data is generated. Tickers with insufficient history are automatically dropped.</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    st.markdown('<div class="data-source-badge">📡 Data Source: Yahoo Finance (via yfinance)</div>', unsafe_allow_html=True)
+    
+    st.markdown('<div class="data-source-badge">📡 Data Source: Yahoo Finance</div>', unsafe_allow_html=True)
 
     # Sidebar
     with st.sidebar:
-        st.markdown("## ⚙️ Controls")
-
-        c1, c2 = st.columns(2)
-        with c1:
-            start_date = st.date_input("Start", value=date(2020, 1, 1), max_value=date.today() - timedelta(days=5))
-        with c2:
-            end_date = st.date_input("End", value=date.today(), max_value=date.today())
-
+        st.markdown("## ⚙️ Configuration Panel")
+        
+        with st.expander("📅 Date Range", expanded=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                start_date = st.date_input(
+                    "Start",
+                    value=date(2020, 1, 1),
+                    max_value=date.today() - timedelta(days=30)
+                )
+            with c2:
+                end_date = st.date_input(
+                    "End",
+                    value=date.today(),
+                    max_value=date.today()
+                )
+        
         if start_date >= end_date:
-            st.error("Start date must be before end date.")
+            st.error("❌ Start date must be before end date.")
             st.stop()
-
-        st.markdown("### 🧺 Universe")
-        tickers = BIST50_TICKERS.copy()
-        st.caption("TRALTIN removed. ASTOR included. Invalid/no-data tickers auto-drop.")
-
-        st.markdown("### 🧠 Portfolio Strategy")
-        strategy = st.selectbox(
-            "Optimization method",
-            ["Equal Weight", "Risk Parity (SciPy)", "Min Volatility", "Max Sharpe", "Efficient Return", "Efficient Risk", "HRP", "CLA", "Black-Litterman"],
-            index=0,
-        )
-
-        st.markdown("### 🧱 Constraints")
-        max_weight = st.slider("Max weight per stock", 0.02, 0.25, 0.12, 0.01)
-
-        enable_sector_caps = st.checkbox("Enable sector caps", value=False)
-        sector_caps = {}
-        if enable_sector_caps:
-            sector_caps["Banking"] = st.slider("Banking cap", 0.10, 0.60, 0.35, 0.01)
-            sector_caps["Holding"] = st.slider("Holding cap", 0.05, 0.50, 0.25, 0.01)
-            sector_caps["Retail"] = st.slider("Retail cap", 0.05, 0.50, 0.20, 0.01)
-            sector_caps["Aviation"] = st.slider("Aviation cap", 0.05, 0.50, 0.25, 0.01)
-            sector_caps["Industrial"] = st.slider("Industrial cap", 0.05, 0.70, 0.40, 0.01)
-            sector_caps["Other"] = st.slider("Other cap", 0.05, 0.80, 0.60, 0.01)
-
-        st.markdown("### 📈 Data cleaning")
-        ffill_limit = st.slider("Forward-fill limit (days)", 1, 10, 5, 1)
-        min_obs = st.slider("Minimum observations per asset", 60, 500, 180, 10)
-        max_missing_frac = st.slider("Max missing fraction (pre-ffill)", 0.0, 0.8, 0.25, 0.05)
-
-        st.markdown("### 📊 Rolling analytics")
-        roll_window = st.slider("Rolling window (days)", 60, 504, 252, 21)
-        top_n_roll = st.slider("Top-N assets in rolling chart", 5, 20, 10, 1)
-
-        st.markdown("### 🧭 Benchmark")
-        include_benchmark = st.checkbox("Include BIST100 benchmark", value=True)
-
-        st.markdown("### 🧪 Stress scenarios")
-        enable_stress = st.checkbox("Enable stress panel", value=True)
-        fx_shock_pct = st.slider("FX shock (USDTRY move)", -20.0, 20.0, 5.0, 0.5)
-        rate_shock_bp = st.slider("Rate shock (proxy bp)", -300, 300, 100, 25)
-
+        
+        with st.expander("🎯 Portfolio Strategy", expanded=True):
+            strategy = st.selectbox(
+                "Optimization Method",
+                [
+                    "Equal Weight",
+                    "Risk Parity (SciPy)",
+                    "Min Volatility",
+                    "Max Sharpe",
+                    "Efficient Return",
+                    "Efficient Risk",
+                    "HRP (Hierarchical Risk Parity)",
+                    "CLA (Critical Line Algorithm)",
+                    "Black-Litterman"
+                ],
+                index=0,
+                help="Select portfolio optimization method"
+            )
+            
+            max_weight = st.slider(
+                "Max Weight per Asset",
+                min_value=0.02,
+                max_value=0.30,
+                value=0.12,
+                step=0.01,
+                help="Maximum allocation to any single stock"
+            )
+        
+        with st.expander("🏭 Sector Constraints", expanded=False):
+            enable_sector_caps = st.checkbox("Enable Sector Caps", value=False)
+            sector_caps = {}
+            if enable_sector_caps:
+                cols = st.columns(2)
+                with cols[0]:
+                    sector_caps["Banking"] = st.slider("Banking", 0.10, 0.60, 0.35, 0.01)
+                    sector_caps["Holding"] = st.slider("Holding", 0.05, 0.50, 0.25, 0.01)
+                    sector_caps["Retail"] = st.slider("Retail", 0.05, 0.50, 0.20, 0.01)
+                with cols[1]:
+                    sector_caps["Industrial"] = st.slider("Industrial", 0.05, 0.70, 0.40, 0.01)
+                    sector_caps["Aviation"] = st.slider("Aviation", 0.05, 0.50, 0.25, 0.01)
+                    sector_caps["Other"] = st.slider("Other", 0.05, 0.80, 0.60, 0.01)
+        
+        with st.expander("📊 Data Quality", expanded=False):
+            ffill_limit = st.slider("Forward-fill Limit (days)", 1, 10, 5, 1)
+            min_obs = st.slider("Minimum Observations", 60, 500, 180, 10)
+            max_missing_frac = st.slider("Max Missing Fraction", 0.0, 0.8, 0.25, 0.05)
+        
+        with st.expander("📈 Analytics Settings", expanded=False):
+            roll_window = st.slider("Rolling Window (days)", 60, 504, 252, 21)
+            top_n_roll = st.slider("Top N for Rolling Chart", 5, 20, 10, 1)
+            
+            include_benchmark = st.checkbox("Include BIST100 Benchmark", value=True)
+            enable_stress = st.checkbox("Enable Stress Testing", value=True)
+            
+            if enable_stress:
+                fx_shock_pct = st.slider("FX Shock (USDTRY %)", -30.0, 30.0, 5.0, 0.5)
+                rate_shock_bp = st.slider("Rate Shock (bp)", -500, 500, 100, 25)
+        
         if not PYPFOPT_AVAILABLE and strategy not in ["Equal Weight", "Risk Parity (SciPy)"]:
-            st.warning("PyPortfolioOpt not available. Mean-variance/HRP/BL/CLA may fallback.")
+            st.warning(
+                "⚠️ PyPortfolioOpt not available. "
+                "Advanced optimization methods will fallback to equal weight."
+            )
+        
+        run_button = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
 
-    # Fetch prices
-    with st.spinner("📥 Fetching prices from Yahoo Finance..."):
-        prices_raw, dropped_raw, meta_fetch = fetch_yahoo_prices(tickers, start_date, end_date)
-
-    if prices_raw.empty:
-        st.error("❌ No data received from Yahoo Finance for the selected range/universe.")
-        st.stop()
-
-    prices, dropped_clean, clean_info = clean_prices_forward_fill(prices_raw, min_obs, max_missing_frac, ffill_limit)
-
-    if prices.empty or prices.shape[1] < 2:
-        st.error("❌ Not enough assets after cleaning (need at least 2).")
-        st.write("Dropped/no-data tickers (raw fetch):", dropped_raw)
-        st.write("Dropped tickers (cleaning filters):", dropped_clean)
-        st.stop()
-
-    returns = returns_from_prices(prices)
-
-    # Benchmark
-    benchmark_prices = None
-    bench_used = None
-    benchmark_returns = None
-    if include_benchmark:
-        for b in BENCHMARK_CANDIDATES:
-            bp_raw, bd_raw, _ = fetch_yahoo_prices([b], start_date, end_date)
-            if not bp_raw.empty and b in bp_raw.columns and bp_raw[b].dropna().shape[0] >= min_obs:
-                benchmark_prices = bp_raw[[b]].ffill(limit=ffill_limit).dropna()
-                bench_used = b
-                break
-
-        if benchmark_prices is not None:
-            common_idx = prices.index.intersection(benchmark_prices.index)
-            prices = prices.loc[common_idx]
-            returns = returns_from_prices(prices)
-            benchmark_returns = benchmark_prices.loc[common_idx, bench_used].pct_change().dropna()
-
-    # Data summary
-    st.markdown('<div class="sub-header">✅ Data Summary</div>', unsafe_allow_html=True)
-    s1, s2, s3, s4 = st.columns(4)
-    with s1:
-        st.metric("Assets (final)", int(returns.shape[1]))
-    with s2:
-        st.metric("Trading days", int(returns.shape[0]))
-    with s3:
-        st.metric("Start (effective)", str(prices.index.min())[:10])
-    with s4:
-        st.metric("End (effective)", str(prices.index.max())[:10])
-
-    with st.expander("🔎 Data diagnostics (what was fetched & what got dropped)"):
-        st.write("Fetch mode:", meta_fetch.get("mode"))
-        if meta_fetch.get("note"):
-            st.write("Fetch note:", meta_fetch.get("note"))
-        st.write("Universe requested:", len(tickers))
-        st.write("Raw columns received:", int(prices_raw.shape[1]))
-        st.write("Dropped/no-data tickers (raw fetch):", dropped_raw)
-        st.write("Dropped tickers (cleaning filters):", dropped_clean)
-        st.write("Final tickers:", returns.columns.tolist())
+    # Main content area
+    if run_button:
+        with st.spinner("📥 Fetching data from Yahoo Finance..."):
+            # Fetch data using enhanced fetcher
+            fetcher = EnhancedDataFetcher()
+            prices_raw, dropped_raw, fetch_metadata = fetcher.fetch_with_retry(
+                BIST50_TICKERS, start_date, end_date
+            )
+        
+        if prices_raw.empty:
+            st.error("❌ No data received from Yahoo Finance.")
+            with st.expander("🔍 Debug Information"):
+                st.json(fetch_metadata)
+            st.stop()
+        
+        # Clean prices
+        with st.spinner("🧹 Cleaning and aligning data..."):
+            prices, dropped_clean, clean_info = EnhancedDataFetcher.clean_prices_forward_fill(
+                prices_raw, min_obs, max_missing_frac, ffill_limit
+            )
+        
+        if prices.empty or prices.shape[1] < 2:
+            st.error("❌ Insufficient assets after cleaning.")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("Dropped (raw fetch):", dropped_raw)
+            with col2:
+                st.write("Dropped (cleaning):", dropped_clean)
+            st.stop()
+        
+        # Calculate returns
+        returns = prices.pct_change().dropna()
+        
+        # Fetch benchmark if requested
+        benchmark_returns = None
         if include_benchmark:
-            st.write("Benchmark used:", bench_used)
-
-    # Optimization
-    st.markdown('<div class="sub-header">🧠 Portfolio Optimization</div>', unsafe_allow_html=True)
-    w, opt_note = optimize_portfolio(prices, returns, strategy, max_weight, sector_caps if enable_sector_caps else {})
-    weights = pd.Series(w, index=returns.columns, name="Weight").sort_values(ascending=False)
-
-    c1, c2, c3 = st.columns([1.4, 1, 1])
-    with c1:
-        st.write("**Selected strategy:**", strategy)
-        st.write("**PyPortfolioOpt available:**", "✅" if PYPFOPT_AVAILABLE else "❌")
-        if opt_note:
-            st.info(opt_note)
-    with c2:
-        st.metric("Max weight cap", f"{max_weight:.0%}")
-    with c3:
-        st.metric("Non-zero weights", int((weights > 1e-6).sum()))
-
-    st.dataframe((weights * 100).round(2).rename("Weight %").to_frame(), use_container_width=True, height=260)
-
-    # Risk metrics
-    rr = RiskEngine.compute(returns, w)
-    risk_metrics = rr.risk_table
-    pm = rr.portfolio_metrics
-
-    st.markdown('<div class="sub-header">📌 Key Portfolio Metrics</div>', unsafe_allow_html=True)
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric("Volatility (Ann.)", f"{pm['volatility']:.2%}")
-    with m2:
-        st.metric("Diversification Ratio", f"{pm['diversification_ratio']:.2f}")
-    with m3:
-        st.metric("Top Risk Contributor", pm["max_risk_asset"], f"{pm['max_risk_contrib']:.1f}%")
-    with m4:
-        st.metric("VaR 95% (1d, hist)", f"{pm['VaR_95_1d']:.2%}")
-
-    # Risk contribution chart
-    st.markdown('<div class="sub-header">🎯 Risk Contribution Analysis</div>', unsafe_allow_html=True)
-    sorted_df = risk_metrics.sort_values("Risk_Contribution_%", ascending=True)
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        y=sorted_df["Symbol"],
-        x=sorted_df["Risk_Contribution_%"],
-        orientation="h",
-        text=sorted_df["Risk_Contribution_%"].round(1).astype(str) + "%",
-        textposition="outside",
-    ))
-    eq_target = 100.0 / len(sorted_df)
-    fig.add_vline(x=eq_target, line_dash="dash", line_color="red", annotation_text=f"Equal {eq_target:.1f}%")
-    fig.update_layout(title="Risk Contribution by Asset", xaxis_title="Risk Contribution (%)", height=720, margin=dict(l=10, r=10, t=50, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Detailed table
-    st.markdown('<div class="sub-header">📋 Detailed Risk Metrics</div>', unsafe_allow_html=True)
-    ddf = risk_metrics.copy()
-    ddf["Weight"] = (ddf["Weight"] * 100).round(2)
-    ddf["Risk_Contribution_%"] = ddf["Risk_Contribution_%"].round(2)
-    ddf["Individual_Volatility"] = (ddf["Individual_Volatility"] * 100).round(2)
-    st.dataframe(ddf[["Risk_Rank", "Symbol", "Sector", "Weight", "Risk_Contribution_%", "Individual_Volatility"]], use_container_width=True, height=520)
-
-    # Rolling RC
-    st.markdown('<div class="sub-header">📈 Rolling Risk Contributions</div>', unsafe_allow_html=True)
-    rr_pct = rolling_risk_contributions(returns, tuple(w.tolist()), roll_window)
-    if rr_pct.empty:
-        st.info("Not enough data for rolling contributions at this window.")
-    else:
-        latest = rr_pct.iloc[-1].sort_values(ascending=False)
-        top_syms = latest.head(top_n_roll).index.tolist()
-        fig_rr = go.Figure()
-        for sym in top_syms:
-            fig_rr.add_trace(go.Scatter(x=rr_pct.index, y=rr_pct[sym], mode="lines", name=sym))
-        fig_rr.update_layout(title=f"Rolling % Risk Contributions (window={roll_window}d) — Top {top_n_roll}", yaxis_title="Contribution (%)", height=460)
-        st.plotly_chart(fig_rr, use_container_width=True)
-
-    # Sector analysis
-    st.markdown('<div class="sub-header">🏭 Sector Risk Analysis</div>', unsafe_allow_html=True)
-    sector_analysis = risk_metrics.groupby("Sector").agg({"Risk_Contribution_%": "sum", "Weight": "sum"}).reset_index()
-    sector_analysis["Weight"] = sector_analysis["Weight"] * 100
-    sector_analysis = sector_analysis.sort_values("Risk_Contribution_%", ascending=False)
-    st.dataframe(sector_analysis, use_container_width=True, height=280)
-
-    # Active risk contributions
-    st.markdown('<div class="sub-header">🧭 Benchmark-Relative (Active) Risk Contributions</div>', unsafe_allow_html=True)
-    active_df = pd.DataFrame()
-    active_meta = {}
-    if benchmark_returns is None:
-        st.info("Benchmark not available in this run (Yahoo returned no usable benchmark history).")
-    else:
-        active_df, active_meta = active_risk_contributions(returns, w, benchmark_returns)
-        a1, a2, a3 = st.columns(3)
-        with a1:
-            st.metric("Tracking Error (Ann.)", f"{active_meta['tracking_error']:.2%}")
-        with a2:
-            st.metric("Active Return (Ann.)", f"{active_meta['active_mean']:.2%}")
-        with a3:
-            st.metric("Information Ratio", f"{active_meta['information_ratio']:.2f}")
-
-        top_active = active_df.head(15).sort_values("Active_Risk_%", ascending=True)
-        fig_a = go.Figure()
-        fig_a.add_trace(go.Bar(y=top_active["Symbol"], x=top_active["Active_Risk_%"], orientation="h"))
-        fig_a.update_layout(title="Top Active Risk Contributors (vs BIST100)", height=520)
-        st.plotly_chart(fig_a, use_container_width=True)
-        st.dataframe(active_df, use_container_width=True, height=320)
-
-    # Stress scenarios
-    st.markdown('<div class="sub-header">🧪 Stress Scenarios</div>', unsafe_allow_html=True)
-    stress_results = {}
-    betas_df = pd.DataFrame()
-    if enable_stress:
-        with st.spinner("📥 Fetching stress factors from Yahoo..."):
-            factors_raw, factors_dropped, _ = fetch_yahoo_prices([FX_FACTOR, RATE_FACTOR], start_date, end_date)
-
-        if factors_raw.empty or FX_FACTOR not in factors_raw.columns:
-            st.warning("FX factor (USDTRY) not available from Yahoo in this run; stress results limited.")
+            for b in BENCHMARK_CANDIDATES:
+                bench_data, _, _ = fetcher.fetch_with_retry([b], start_date, end_date)
+                if not bench_data.empty and b in bench_data.columns:
+                    benchmark_returns = bench_data[b].pct_change().dropna()
+                    break
+        
+        # Data summary
+        st.markdown('<div class="sub-header">✅ Data Summary</div>', unsafe_allow_html=True)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Assets (final)", returns.shape[1])
+        with col2:
+            st.metric("Trading Days", returns.shape[0])
+        with col3:
+            st.metric("Date Range", f"{returns.index[0].strftime('%Y-%m-%d')}")
+        with col4:
+            st.metric("to", f"{returns.index[-1].strftime('%Y-%m-%d')}")
+        
+        with st.expander("🔍 Data Quality Details"):
+            st.write("**Fetch Strategy:**", fetch_metadata.get("strategy", "unknown"))
+            st.write("**Dropped Tickers:**", dropped_raw + dropped_clean)
+            st.write("**Final Tickers:**", returns.columns.tolist())
+            if include_benchmark and benchmark_returns is not None:
+                st.write("**Benchmark:**", "BIST100 (XU100)")
+        
+        # Optimize portfolio
+        with st.spinner("🧮 Optimizing portfolio..."):
+            w, opt_note = EnhancedPortfolioOptimizer.optimize(
+                prices, returns, strategy, max_weight, sector_caps if enable_sector_caps else {}
+            )
+        
+        # Calculate risk metrics
+        risk_engine = EnhancedRiskEngine()
+        risk_results = risk_engine.compute(returns, w)
+        
+        # Display results
+        st.markdown('<div class="sub-header">📊 Portfolio Analysis Results</div>', unsafe_allow_html=True)
+        
+        # Key metrics in cards
+        cols = st.columns(4)
+        with cols[0]:
+            st.metric(
+                "Annual Volatility",
+                f"{risk_results.portfolio_metrics['volatility']:.2%}",
+                help="Annualized portfolio volatility"
+            )
+        with cols[1]:
+            st.metric(
+                "Total Return",
+                f"{risk_results.portfolio_metrics['total_return']:.2%}",
+                help="Cumulative total return over the period"
+            )
+        with cols[2]:
+            st.metric(
+                "Max Drawdown",
+                f"{risk_results.portfolio_metrics['max_drawdown']:.2%}",
+                help="Maximum peak-to-trough decline"
+            )
+        with cols[3]:
+            st.metric(
+                "Diversification Ratio",
+                f"{risk_results.portfolio_metrics['diversification_ratio']:.2f}",
+                help="Weighted avg vol / portfolio vol"
+            )
+        
+        # Second row of metrics
+        cols = st.columns(4)
+        with cols[0]:
+            st.metric(
+                "VaR (95%)",
+                f"{risk_results.tail_metrics.get('VaR_95', 0):.2%}",
+                help="Value at Risk at 95% confidence"
+            )
+        with cols[1]:
+            st.metric(
+                "CVaR (95%)",
+                f"{risk_results.tail_metrics.get('CVaR_95', 0):.2%}",
+                help="Conditional VaR at 95% confidence"
+            )
+        with cols[2]:
+            st.metric(
+                "Sharpe Ratio",
+                f"{risk_results.portfolio_metrics.get('Sharpe_Ratio', 0):.2f}",
+                help="Risk-adjusted return"
+            )
+        with cols[3]:
+            st.metric(
+                "Calmar Ratio",
+                f"{risk_results.portfolio_metrics.get('Calmar_Ratio', 0):.2f}",
+                help="CAGR / Max Drawdown"
+            )
+        
+        # Create and display dashboard
+        visualizer = EnhancedVisualizer()
+        dashboard = visualizer.create_dashboard(
+            returns, w, risk_results, benchmark_returns
+        )
+        st.plotly_chart(dashboard, use_container_width=True)
+        
+        # Efficient Frontier (if applicable)
+        if strategy in ["Min Volatility", "Max Sharpe", "Efficient Return", "Efficient Risk"]:
+            st.markdown('<div class="sub-header">📈 Efficient Frontier</div>', unsafe_allow_html=True)
+            ef_plot = visualizer.plot_efficient_frontier(prices if prices is not None else returns)
+            st.plotly_chart(ef_plot, use_container_width=True)
+        
+        # Detailed risk table
+        st.markdown('<div class="sub-header">📋 Detailed Risk Metrics</div>', unsafe_allow_html=True)
+        display_df = risk_results.risk_table.copy()
+        display_df['Weight'] = display_df['Weight'] * 100
+        display_df['Individual_Volatility'] = display_df['Individual_Volatility'] * 100
+        display_df['Risk_Contribution_%'] = display_df['Risk_Contribution_%'].round(2)
+        
+        st.dataframe(
+            display_df[[
+                'Risk_Rank', 'Symbol', 'Company', 'Sector', 'Market_Cap',
+                'Weight', 'Risk_Contribution_%', 'Individual_Volatility',
+                'Risk_Weight_Ratio'
+            ]].round(2),
+            use_container_width=True,
+            height=500
+        )
+        
+        # Rolling risk contributions
+        st.markdown('<div class="sub-header">📈 Rolling Risk Contributions</div>', unsafe_allow_html=True)
+        
+        @st.cache_data
+        def calc_rolling_rc(returns_df, weights_tuple, window):
+            w = np.array(weights_tuple)
+            tickers = returns_df.columns.tolist()
+            results = []
+            dates = []
+            
+            for i in range(window, len(returns_df) + 1):
+                sub = returns_df.iloc[i-window:i]
+                cov = sub.cov() * 252
+                port_var = w @ cov.values @ w
+                port_vol = np.sqrt(max(port_var, 1e-12))
+                mrc = (cov.values @ w) / port_vol
+                rc_pct = (w * mrc / port_vol) * 100
+                results.append(rc_pct)
+                dates.append(returns_df.index[i-1])
+            
+            if results:
+                return pd.DataFrame(results, index=dates, columns=tickers)
+            return pd.DataFrame()
+        
+        rolling_rc = calc_rolling_rc(returns, tuple(w.tolist()), roll_window)
+        
+        if not rolling_rc.empty:
+            latest = rolling_rc.iloc[-1].sort_values(ascending=False)
+            top_symbols = latest.head(top_n_roll).index.tolist()
+            
+            fig_rolling = go.Figure()
+            for sym in top_symbols:
+                fig_rolling.add_trace(go.Scatter(
+                    x=rolling_rc.index,
+                    y=rolling_rc[sym],
+                    mode='lines',
+                    name=COMPANY_METADATA.get(sym, {}).get('name', sym),
+                    line=dict(width=1.5)
+                ))
+            
+            fig_rolling.update_layout(
+                title=f'Rolling Risk Contribution (Window: {roll_window} days)',
+                xaxis_title='Date',
+                yaxis_title='Risk Contribution (%)',
+                height=500,
+                hovermode='x unified',
+                legend=dict(
+                    yanchor="top",
+                    y=0.99,
+                    xanchor="left",
+                    x=1.05
+                )
+            )
+            
+            st.plotly_chart(fig_rolling, use_container_width=True)
         else:
-            factors_raw = factors_raw.ffill(limit=ffill_limit).dropna()
-            common = returns.index.intersection(factors_raw.index)
-            fx = factors_raw.loc[common, FX_FACTOR].pct_change().dropna()
-            if RATE_FACTOR in factors_raw.columns:
-                tnx = factors_raw.loc[common, RATE_FACTOR]
-                rate_yield_dec = (tnx / 1000.0)
-                rate_changes = rate_yield_dec.diff().dropna()
-            else:
-                rate_changes = pd.Series(0.0, index=fx.index)
-
-            common2 = returns.index.intersection(fx.index).intersection(rate_changes.index)
-            R = returns.loc[common2]
-            fx = fx.loc[common2]
-            rate_changes = rate_changes.loc[common2]
-
-            betas_df = estimate_factor_betas(R, fx, rate_changes, min_obs=min(120, max(60, len(common2)//2)))
-            betas_df = betas_df.set_index("Symbol").reindex(returns.columns).reset_index()
-
-            stress_results = stress_scenario_impact(w, betas_df, fx_shock_pct/100.0, rate_shock_bp)
-            st.write(f"Scenario: FX {fx_shock_pct:+.1f}% (USDTRY), Rate {rate_shock_bp:+d} bp (proxy {RATE_FACTOR}).")
-            st.metric("Estimated 1-day portfolio impact", f"{stress_results['portfolio_impact']:+.2%}")
-            det = stress_results["details"].copy()
-            det["Shock_Return"] = (det["Shock_Return"] * 100).round(3)
-            det["Contribution"] = (det["Contribution"] * 100).round(3)
-            st.dataframe(det.head(20), use_container_width=True, height=320)
+            st.info("Insufficient data for rolling calculations.")
+        
+        # Monte Carlo Simulation
+        if enable_stress:
+            st.markdown('<div class="sub-header">🎲 Monte Carlo Simulation</div>', unsafe_allow_html=True)
+            
+            with st.spinner("Running Monte Carlo simulation..."):
+                mc_simulator = MonteCarloSimulator()
+                sim_results = mc_simulator.simulate_returns(
+                    returns, w, n_simulations=5000, horizon_days=252
+                )
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Median Final Value", f"{sim_results['median_final']:.2f}x")
+                with col2:
+                    st.metric("VaR (95%)", f"{sim_results['var_95']:.2f}x")
+                with col3:
+                    st.metric("CVaR (95%)", f"{sim_results['cvar_95']:.2f}x")
+                with col4:
+                    st.metric("Loss Probability", f"{sim_results['probability_loss']:.1f}%")
+                
+                sim_plot = mc_simulator.plot_simulations(sim_results)
+                st.plotly_chart(sim_plot, use_container_width=True)
+        
+        # Export functionality
+        st.markdown('<div class="sub-header">📦 Export Report</div>', unsafe_allow_html=True)
+        
+        # Prepare export data
+        export_data = {
+            'Portfolio_Weights': pd.DataFrame({
+                'Symbol': risk_results.risk_table['Symbol'],
+                'Company': risk_results.risk_table['Company'],
+                'Weight_%': risk_results.risk_table['Weight'] * 100,
+                'Sector': risk_results.risk_table['Sector']
+            }),
+            'Risk_Metrics': risk_results.risk_table,
+            'Portfolio_Summary': pd.DataFrame([risk_results.portfolio_metrics]),
+            'Drawdown_Analysis': risk_results.drawdown_analysis,
+            'Tail_Risk_Metrics': pd.DataFrame([risk_results.tail_metrics])
+        }
+        
+        if not rolling_rc.empty:
+            export_data['Rolling_Risk'] = rolling_rc.tail(500).reset_index()
+        
+        if enable_stress and 'sim_results' in locals():
+            export_data['Monte_Carlo'] = pd.DataFrame({
+                'Final_Values': sim_results['final_values']
+            })
+        
+        # Convert to Excel
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            for sheet_name, df in export_data.items():
+                if df is not None and not df.empty:
+                    df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+        
+        st.download_button(
+            "📥 Download Full Report (Excel)",
+            data=output.getvalue(),
+            file_name=f"bist_risk_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    
     else:
-        st.info("Stress scenarios disabled.")
-
-    # Export
-    st.markdown('<div class="sub-header">📦 Export</div>', unsafe_allow_html=True)
-    sheets = {
-        "Portfolio_Weights": weights.reset_index().rename(columns={"index": "Symbol"}),
-        "Risk_Metrics": risk_metrics,
-        "Sector_Analysis": sector_analysis,
-        "Portfolio_Summary": pd.DataFrame([pm]),
-    }
-    if not active_df.empty:
-        sheets["Active_Risk"] = active_df
-        sheets["Active_Summary"] = pd.DataFrame([active_meta])
-    if not rr_pct.empty:
-        sheets["Rolling_RC_pct"] = rr_pct.tail(250).reset_index().rename(columns={"index": "Date"})
-    if enable_stress and stress_results:
-        sheets["Stress_Details"] = stress_results["details"].reset_index(drop=True)
-        if not betas_df.empty:
-            sheets["Factor_Betas"] = betas_df
-
-    xlsx = to_excel_bytes(sheets)
-    st.download_button(
-        "📥 Download Full Report (Excel)",
-        data=xlsx,
-        file_name=f"bist_risk_budgeting_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    st.markdown("---")
+        # Welcome screen
+        st.info("👈 Configure parameters in the sidebar and click **Run Analysis** to start.")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown("""
+            ### 🎯 Features
+            - BIST50 Universe
+            - Multiple optimization strategies
+            - Advanced risk metrics
+            - Sector constraints
+            """)
+        with col2:
+            st.markdown("""
+            ### 📊 Analytics
+            - Risk decomposition
+            - VaR / CVaR analysis
+            - Drawdown analysis
+            - Monte Carlo simulation
+            """)
+        with col3:
+            st.markdown("""
+            ### 📈 Visualizations
+            - Interactive dashboards
+            - Efficient frontier
+            - Rolling metrics
+            - Export capabilities
+            """)
+    
+    # Footer
     st.markdown(
-        "<div class='small-muted'><b>The Quantitative Analysis Performed by LabGen25@Istanbul by Murat KONUKLAR 2026</b></div>",
+        """
+        <div class="footer">
+        <b>The Quantitative Analysis Performed by LabGen25@Istanbul by Murat KONUKLAR 2026</b>
+        <br/>
+        <span class="small-muted">Data Source: Yahoo Finance | Risk Models: PyPortfolioOpt, SciPy</span>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
-
+    
+    # PyPortfolioOpt warning if needed
     if not PYPFOPT_AVAILABLE:
-        st.warning(
-            "PyPortfolioOpt could not be imported. This usually means the Streamlit Cloud build "
-            "failed to install cvxpy/solver dependencies under your Python version. Use the pinned requirements "
-            "provided with this app and set Python to 3.11 in Streamlit Cloud settings."
+        st.sidebar.warning(
+            "⚠️ **PyPortfolioOpt not available**\n\n"
+            "This limits optimization options. To enable full functionality, "
+            "ensure Python 3.11 and proper dependencies in Streamlit Cloud."
         )
 
 if __name__ == "__main__":
