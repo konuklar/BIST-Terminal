@@ -1,5 +1,5 @@
 # Streamlit Community Cloud dependencies (repo root)
-# app.py expects these packages.
+# This app is designed to utilize PyPortfolioOpt.
 
 streamlit>=1.32
 numpy>=1.23
@@ -14,25 +14,13 @@ lxml>=4.9
 openpyxl>=3.1
 xlsxwriter>=3.1
 
-# Optional (advanced optimization + reporting)
+# PyPortfolioOpt + solvers (required for optimization features)
 PyPortfolioOpt>=1.5.5
 cvxpy>=1.4
 osqp>=0.6
 scs>=3.2
 ecos>=2.0
 
+# Optional reporting (kept optional in app toggle)
 quantstats>=0.0.62
 matplotlib>=3.7
-seaborn>=0.13
-# Streamlit Community Cloud requirements (repo root)
-# Place this file as: requirements.txt  (or keep as requirements_streamlit.txt and copy/rename)
-
-streamlit>=1.32
-pandas>=2.0
-numpy>=1.24
-yfinance>=0.2.36
-plotly>=5.18
-scipy>=1.10
-PyPortfolioOpt>=1.5.5
-quantstats>=0.0.62
-openpyxl>=3.1.2
