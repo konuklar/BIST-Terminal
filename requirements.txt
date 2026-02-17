@@ -1,0 +1,26 @@
+# Streamlit Community Cloud dependencies (repo root)
+# app.py expects these packages.
+
+streamlit>=1.32
+numpy>=1.23
+pandas>=2.0
+scipy>=1.10
+yfinance>=0.2.36
+plotly>=5.18
+requests>=2.31
+lxml>=4.9
+
+# Export helpers
+openpyxl>=3.1
+xlsxwriter>=3.1
+
+# Optional (advanced optimization + reporting)
+PyPortfolioOpt>=1.5.5
+cvxpy>=1.4
+osqp>=0.6
+scs>=3.2
+ecos>=2.0
+
+quantstats>=0.0.62
+matplotlib>=3.7
+seaborn>=0.13
