@@ -72,6 +72,14 @@ st.markdown(
 .sub-header { font-size: 1.35rem; font-weight: 750; margin: 0.85rem 0 0.25rem 0; }
 .small-note { color:#6b7280; font-size:0.92rem; }
 .kpi-note { color:#6b7280; font-size:0.85rem; margin-top:-6px; }
+
+    .credits {
+        font-size: 0.9rem;
+        color: #6B7280;
+        font-weight: 600;
+        margin-top: -0.25rem;
+        margin-bottom: 1.0rem;
+    }
 </style>
 """,
     unsafe_allow_html=True,
@@ -403,6 +411,39 @@ class BISTDataFetcher:
 
         return prices, rets, sorted(list(set(dropped))), diag
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_single_close(ticker: str, start: str, end: str) -> pd.Series:
+    """Fetch a single Close series with fallback (used for stress-factor proxies)."""
+    t = str(ticker).strip()
+    if not t:
+        return pd.Series(dtype=float)
+    try:
+        df = yf.download(
+            t, start=start, end=end, interval="1d",
+            auto_adjust=True, progress=False, threads=False, timeout=30
+        )
+        if df is not None and not df.empty:
+            if "Close" in df.columns:
+                s = df["Close"].copy()
+            elif "Adj Close" in df.columns:
+                s = df["Adj Close"].copy()
+            else:
+                s = df.iloc[:, 0].copy()
+            s.name = t
+            return s.dropna()
+    except Exception:
+        pass
+    try:
+        hist = yf.Ticker(t).history(start=start, end=end, interval="1d", auto_adjust=True)
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            s = hist["Close"].copy()
+            s.name = t
+            return s.dropna()
+    except Exception:
+        pass
+    return pd.Series(dtype=float)
+
 # =============================================================
 # Risk + Performance Analytics
 # =============================================================
@@ -456,6 +497,84 @@ class RiskEngine:
             "max_risk_symbol": str(rm.iloc[0]["Symbol"]),
         }
         return rm, pm, cov_df
+
+
+@staticmethod
+def active_risk_contributions(
+    returns: pd.DataFrame,
+    benchmark_returns: pd.Series,
+    weights: np.ndarray,
+    benchmark_label: str = "Benchmark",
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Active risk (tracking error) decomposition vs benchmark.
+    We treat the *active* return as:  r_active = w'R_assets  - 1 * R_benchmark
+
+    Implementation:
+    - Build an "extended" return matrix: [assets..., benchmark]
+    - Extended weights: [w_assets..., -1]
+    - Risk contributions computed on tracking error volatility.
+    This yields a contributions table that sums to 100% (including the benchmark leg).
+    """
+    if benchmark_returns is None or benchmark_returns.empty:
+        return pd.DataFrame(), {}
+
+    # Align
+    idx = returns.index.intersection(benchmark_returns.index)
+    if len(idx) < 30:
+        return pd.DataFrame(), {}
+
+    R = returns.loc[idx].copy()
+    b = benchmark_returns.loc[idx].rename(benchmark_label)
+    R_ext = R.copy()
+    R_ext[benchmark_label] = b
+
+    w = np.asarray(weights, dtype=float).reshape(-1)
+    w = np.clip(w, 0, None)
+    w = w / (w.sum() if w.sum() != 0 else 1.0)
+
+    w_ext = np.concatenate([w, np.array([-1.0])], axis=0)
+
+    cov = (R_ext.cov() * 252.0).values
+    te_var = float(w_ext @ cov @ w_ext)
+    te_vol = float(np.sqrt(max(te_var, 0.0)))
+
+    if te_vol <= 0:
+        return pd.DataFrame(), {}
+
+    mrc = (cov @ w_ext) / te_vol
+    crc = w_ext * mrc
+    pct = (crc / te_vol) * 100.0
+
+    syms = list(R.columns) + [benchmark_label]
+    df = pd.DataFrame({
+        "Symbol": syms,
+        "Weight": w_ext,
+        "Marginal_Risk_Contribution": mrc,
+        "Component_Risk": crc,
+        "Risk_Contribution_%": pct,
+    })
+
+    # Summary
+    active = (R.values @ w) - b.values
+    active = pd.Series(active, index=idx, name="ActiveReturn")
+    te_ann = te_vol
+    te_daily = active.std(ddof=1)
+    var95 = active.quantile(0.05)
+    es95 = active[active <= var95].mean() if (active <= var95).any() else np.nan
+
+    summary = {
+        "tracking_error_ann": te_ann,
+        "tracking_error_daily": float(te_daily) if np.isfinite(te_daily) else np.nan,
+        "active_var95_daily": float(var95) if np.isfinite(var95) else np.nan,
+        "active_es95_daily": float(es95) if np.isfinite(es95) else np.nan,
+    }
+
+    # Rank by absolute contribution
+    df["Abs_RC_%"] = df["Risk_Contribution_%"].abs()
+    df = df.sort_values("Abs_RC_%", ascending=False).drop(columns=["Abs_RC_%"]).reset_index(drop=True)
+    df["Risk_Rank"] = np.arange(1, len(df) + 1)
+    return df, summary
 
     @staticmethod
     def constrained_risk_parity(
@@ -810,6 +929,104 @@ def pypfopt_optimize(
 # Plotly visuals
 # =============================================================
 
+
+# =========================================================
+# Stress Scenarios Engine (Rate + FX shocks)
+# =========================================================
+
+class StressEngine:
+    @staticmethod
+    def _ols_betas(y: np.ndarray, X: np.ndarray) -> np.ndarray:
+        """OLS betas with intercept; returns betas (without intercept)."""
+        # Add intercept
+        Xc = np.column_stack([np.ones(len(X)), X])
+        try:
+            beta = np.linalg.lstsq(Xc, y, rcond=None)[0]
+            return beta[1:]
+        except Exception:
+            return np.zeros(X.shape[1], dtype=float)
+
+    @staticmethod
+    def estimate_betas(
+        asset_returns: pd.DataFrame,
+        factor_returns: pd.DataFrame,
+        min_obs: int = 60,
+    ) -> pd.DataFrame:
+        """
+        Estimate multi-factor betas for each asset:
+            r_i = a + b1*f1 + b2*f2 + ...
+        Returns a DataFrame [assets x factors].
+        """
+        # Align
+        idx = asset_returns.index.intersection(factor_returns.index)
+        A = asset_returns.loc[idx].dropna(how="all")
+        F = factor_returns.loc[idx].dropna(how="any")
+        idx2 = A.index.intersection(F.index)
+        A = A.loc[idx2]
+        F = F.loc[idx2]
+
+        betas = {}
+        if len(idx2) < min_obs or A.shape[1] < 1 or F.shape[1] < 1:
+            return pd.DataFrame()
+
+        X = F.values
+        for col in A.columns:
+            y = A[col].values
+            m = np.isfinite(y) & np.isfinite(X).all(axis=1)
+            if m.sum() < min_obs:
+                continue
+            betas[col] = StressEngine._ols_betas(y[m], X[m])
+
+        if not betas:
+            return pd.DataFrame()
+
+        bdf = pd.DataFrame(betas, index=F.columns).T
+        return bdf
+
+    @staticmethod
+    def scenario_impact(
+        weights: np.ndarray,
+        betas: pd.DataFrame,
+        shock: Dict[str, float],
+        include_assets: Optional[List[str]] = None,
+    ) -> Tuple[pd.DataFrame, float]:
+        """
+        Apply a factor shock to assets:
+            delta_r_i ≈ sum_k beta_{i,k} * shock_k
+        Returns:
+            - per-asset table with delta_r and contribution
+            - portfolio delta_r
+        """
+        if betas is None or betas.empty:
+            return pd.DataFrame(), float("nan")
+
+        assets = betas.index.tolist()
+        if include_assets is not None:
+            assets = [a for a in assets if a in include_assets]
+            betas = betas.loc[assets]
+
+        w = np.asarray(weights, dtype=float).reshape(-1)
+        if include_assets is not None:
+            # Map weights to subset
+            w_map = {sym: w[i] for i, sym in enumerate(include_assets)}
+            w = np.array([w_map.get(a, 0.0) for a in assets], dtype=float)
+
+        # Compute delta returns
+        shocks = np.array([shock.get(f, 0.0) for f in betas.columns], dtype=float)
+        delta = betas.values @ shocks  # per asset
+        contrib = w * delta
+        port_delta = float(np.nansum(contrib))
+
+        df = pd.DataFrame({
+            "Symbol": assets,
+            "Weight": w,
+            **{f"Beta_{c}": betas[c].values for c in betas.columns},
+            "Delta_Return": delta,
+            "Contribution": contrib,
+        }).sort_values("Contribution", key=lambda s: s.abs(), ascending=False).reset_index(drop=True)
+
+        return df, port_delta
+
 def fig_cum_and_drawdown(port: pd.Series, bench: Optional[pd.Series]) -> go.Figure:
     pr = port.dropna()
     cum = (1 + pr).cumprod()
@@ -850,6 +1067,41 @@ def fig_risk_contrib_bar(risk_df: pd.DataFrame, name_map: Dict[str, str], top_n:
                   annotation_text=f"Equal RC (~{eq:.1f}%)")
     fig.update_layout(height=680, title="Risk Contribution by Asset", margin=dict(l=10, r=10, t=60, b=10))
     return fig
+
+
+def fig_active_risk_contrib_bar(active_df: pd.DataFrame, name_map: Dict[str, str], benchmark_label: str) -> go.Figure:
+    """Bar chart for active risk (tracking error) contributions; includes benchmark leg."""
+    df = active_df.copy()
+    df["Label"] = df["Symbol"].apply(lambda s: name_map.get(s, s))
+    df.loc[df["Symbol"] == benchmark_label, "Label"] = benchmark_label
+
+    # show top by absolute contribution
+    df["abs_rc"] = df["Risk_Contribution_%"].abs()
+    df = df.sort_values("abs_rc", ascending=False).head(35).sort_values("Risk_Contribution_%", ascending=True)
+
+    colors = np.where(df["Risk_Contribution_%"] >= 0, "#2563EB", "#DC2626")
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=df["Label"],
+        x=df["Risk_Contribution_%"],
+        orientation="h",
+        marker=dict(color=colors),
+        text=df["Risk_Contribution_%"].map(lambda x: f"{x:+.1f}%"),
+        textposition="outside",
+        name="Active RC (%)",
+    ))
+    fig.add_vline(x=0, line_width=1, line_color="gray", opacity=0.7)
+    fig.update_layout(
+        title="Active Risk Contributions (Tracking Error) — includes Benchmark Leg",
+        xaxis_title="Risk Contribution (%)",
+        yaxis_title="",
+        height=760,
+        showlegend=False,
+        hovermode="y",
+    )
+    return fig
+
 
 def fig_corr_heatmap(returns: pd.DataFrame, max_assets: int = 35) -> go.Figure:
     cols = list(returns.columns)
@@ -898,6 +1150,7 @@ def fig_rolling_rc(rc_pct: pd.DataFrame, name_map: Dict[str, str], top_n: int = 
 
 def main():
     st.markdown('<div class="main-header">📊 Advanced BIST Risk Budgeting System</div>', unsafe_allow_html=True)
+    st.markdown("<div class='credits'>The Quantitative Analysis Performed by LabGen25@Istanbul by Murat KONUKLAR 2026</div>", unsafe_allow_html=True)
     st.markdown('<div class="badge">📡 Data Source: Yahoo Finance (yfinance)</div>', unsafe_allow_html=True)
 
     fetcher = BISTDataFetcher()
@@ -1170,7 +1423,24 @@ def main():
     else:
         port_aligned = port
 
-    perf = performance_report(port_aligned, bench_aligned)
+    
+perf = performance_report(port_aligned, bench_aligned)
+
+# Active risk (export-ready)
+active_df_export = pd.DataFrame()
+active_summary_export = {}
+if bench_aligned is not None:
+    try:
+        active_df_export, active_summary_export = RiskEngine.active_risk_contributions(
+            returns=returns,
+            benchmark_returns=bench_aligned,
+            weights=weights,
+            benchmark_label=benchmark_label,
+        )
+    except Exception:
+        active_df_export = pd.DataFrame()
+        active_summary_export = {}
+
 
     # VaR/ES
     var_tbl = var_es_table(
@@ -1208,7 +1478,7 @@ def main():
     # Charts
     # =========================================================
     tabs = st.tabs([
-        "Performance", "Risk Contributions", "VaR / ES", "Correlation", "Rolling RC", "Weights & Tables", "Export"
+        "Performance", "Risk Contributions", "Active Risk (vs Benchmark)", "VaR / ES", "Correlation", "Rolling RC", "Stress Scenarios", "Weights & Tables", "Export"
     ])
 
     with tabs[0]:
@@ -1235,21 +1505,169 @@ def main():
         )[["Risk_Rank","Symbol","Company","Sector","Weight","Risk_Contribution_%","Individual_Volatility","Marginal_Risk_Contribution"]]
           .sort_values("Risk_Rank"), use_container_width=True, height=560)
 
+    
     with tabs[2]:
+        if bench_aligned is None:
+            st.info("Benchmark is not available/selected — enable a benchmark in the sidebar to compute active risk (tracking error).")
+        else:
+            # Active risk contributions vs benchmark
+            active_df, active_summary = RiskEngine.active_risk_contributions(
+                returns=returns,
+                benchmark_returns=bench_aligned,
+                weights=weights,
+                benchmark_label=benchmark_label,
+            )
+    
+            st.markdown("### Active Risk (Tracking Error) vs Benchmark")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Tracking Error (ann.)", f"{active_summary.get('tracking_error_ann', np.nan):.2%}" if active_summary else "—")
+            c2.metric("Tracking Error (daily)", f"{active_summary.get('tracking_error_daily', np.nan):.2%}" if active_summary else "—")
+            c3.metric("Active VaR 95% (1d)", f"{abs(active_summary.get('active_var95_daily', np.nan)):.2%}" if active_summary else "—")
+            c4.metric("Active ES 95% (1d)", f"{abs(active_summary.get('active_es95_daily', np.nan)):.2%}" if active_summary else "—")
+    
+            if active_df is None or active_df.empty:
+                st.warning("Active risk table is empty (insufficient overlap with benchmark).")
+            else:
+                st.plotly_chart(fig_active_risk_contrib_bar(active_df, name_map, benchmark_label), use_container_width=True)
+    
+                # Enrich table with names/sectors (benchmark leg kept as-is)
+                table_df = active_df.copy()
+                table_df["Company"] = table_df["Symbol"].apply(lambda s: name_map.get(s, s))
+                table_df["Sector"] = table_df["Symbol"].apply(lambda s: sector_map.get(s, fetcher.META.get(s, AssetMeta(s, 'Other')).sector) if sector_map else fetcher.META.get(s, AssetMeta(s, 'Other')).sector)
+                table_df.loc[table_df["Symbol"] == benchmark_label, "Company"] = benchmark_label
+                table_df.loc[table_df["Symbol"] == benchmark_label, "Sector"] = "Benchmark"
+    
+                show_cols = ["Risk_Rank", "Symbol", "Company", "Sector", "Weight", "Risk_Contribution_%", "Marginal_Risk_Contribution", "Component_Risk"]
+                st.dataframe(table_df[show_cols], use_container_width=True, height=560)
+    
+                st.caption("Note: Active risk decomposition includes a **benchmark leg** with weight = -1. This ensures contributions sum to 100% for tracking error.")
+    
+        
+
+    with tabs[3]:
         st.plotly_chart(fig_var_table(var_tbl), use_container_width=True)
         st.caption("VaR/ES are shown as **loss magnitudes**. Example: VaR=0.03 means a 3% loss threshold.")
 
-    with tabs[3]:
+    with tabs[4]:
         st.plotly_chart(fig_corr_heatmap(returns, max_assets=35), use_container_width=True)
 
-    with tabs[4]:
+    with tabs[5]:
         if compute_rolling and (rc_roll is not None) and (not rc_roll.empty):
             st.plotly_chart(fig_rolling_rc(rc_roll, name_map, top_n=int(roll_topn)), use_container_width=True)
             st.caption("Rolling RC (%) is computed with covariance over the rolling window and fixed weights.")
         else:
             st.info("Rolling RC is empty (try smaller window/step, or ensure enough data).")
 
-    with tabs[5]:
+    
+    with tabs[6]:
+        st.markdown("### Stress Scenarios (Rate Shock / FX Shock)")
+        st.caption("This module estimates **historical factor betas** to FX and rate proxies, then applies user-defined shocks. It is a *scenario approximation* (not a structural model).")
+    
+        s1, s2, s3, s4 = st.columns([1.2, 1.2, 1.0, 1.0])
+        with s1:
+            fx_ticker = st.text_input("FX proxy ticker", value="TRY=X", help="Default: USD/TRY (Yahoo: TRY=X)")
+        with s2:
+            rate_ticker = st.text_input("Rate proxy ticker", value="^TNX", help="Default: US 10Y yield index (proxy). You can change to any Yahoo ticker.")
+        with s3:
+            fx_shock_pct = st.slider("FX shock (%)", min_value=-25.0, max_value=25.0, value=5.0, step=0.5)
+        with s4:
+            rate_shock_bps = st.slider("Rate shock (bps)", min_value=-500, max_value=500, value=100, step=25)
+    
+        # Fetch factor series
+        fx_close = fetch_single_close(fx_ticker, start=str(start_date), end=str(end_date))
+        rate_close = fetch_single_close(rate_ticker, start=str(start_date), end=str(end_date))
+    
+        if fx_close.empty or rate_close.empty:
+            st.warning("Could not fetch one or both factor series. Try different tickers or shorten the date range.")
+        else:
+            fx_ret = fx_close.pct_change().dropna()
+            rate_ret = rate_close.pct_change().dropna()
+    
+            # Convert rate shock in bps into an approximate return shock on the rate proxy
+            # (for yield-index proxies like ^TNX, approximate by relative yield move)
+            last_rate = float(rate_close.dropna().iloc[-1])
+            approx_yield = last_rate / 10.0 if str(rate_ticker).startswith("^TNX") else last_rate
+            if approx_yield and np.isfinite(approx_yield) and approx_yield > 0:
+                rate_shock_return = (rate_shock_bps / 10000.0) / approx_yield
+            else:
+                rate_shock_return = (rate_shock_bps / 10000.0)
+    
+            shock = {
+                fx_ticker: fx_shock_pct / 100.0,
+                rate_ticker: rate_shock_return,
+            }
+    
+            factors = pd.DataFrame({
+                fx_ticker: fx_ret,
+                rate_ticker: rate_ret,
+            })
+    
+            betas = StressEngine.estimate_betas(asset_returns=returns, factor_returns=factors, min_obs=80)
+            if betas.empty:
+                st.warning("Not enough overlap to estimate factor betas (try shorter min obs / different proxies / different date range).")
+            else:
+                impact_df, port_delta = StressEngine.scenario_impact(
+                    weights=weights,
+                    betas=betas,
+                    shock=shock,
+                    include_assets=loaded,
+                )
+    
+                # Enrich + display
+                impact_df["Company"] = impact_df["Symbol"].apply(lambda s: name_map.get(s, s))
+                impact_df["Sector"] = impact_df["Symbol"].apply(lambda s: sector_map.get(s, fetcher.META.get(s, AssetMeta(s, 'Other')).sector) if sector_map else fetcher.META.get(s, AssetMeta(s, 'Other')).sector)
+                impact_df["Delta_Return_%"] = impact_df["Delta_Return"] * 100.0
+                impact_df["Contribution_%"] = impact_df["Contribution"] * 100.0
+    
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Portfolio impact (Δ return)", f"{port_delta:+.2%}")
+                c2.metric("FX shock", f"{fx_shock_pct:+.1f}%")
+                c3.metric("Rate shock (approx return)", f"{shock[rate_ticker]:+.2%}")
+    
+                if bench_aligned is not None:
+                    # Benchmark impact + active impact
+                    bench_betas = StressEngine.estimate_betas(
+                        asset_returns=pd.DataFrame({benchmark_label: bench_aligned}),
+                        factor_returns=factors,
+                        min_obs=80,
+                    )
+                    if not bench_betas.empty and benchmark_label in bench_betas.index:
+                        bench_row = bench_betas.loc[benchmark_label]
+                        bench_delta = float(np.nansum(bench_row.values * np.array([shock.get(c, 0.0) for c in bench_betas.columns])))
+                        active_delta = port_delta - bench_delta
+                        st.info(f"Benchmark impact: {bench_delta:+.2%}  •  Active impact (Portfolio − Benchmark): {active_delta:+.2%}")
+                    else:
+                        st.info("Benchmark impact not available (beta estimation failed).")
+    
+                # Plot top contributions
+                topn = min(25, len(impact_df))
+                plot_df = impact_df.head(topn).iloc[::-1]
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=plot_df["Contribution_%"],
+                    y=plot_df["Company"],
+                    orientation="h",
+                    text=plot_df["Contribution_%"].map(lambda x: f"{x:+.2f}%"),
+                    textposition="outside",
+                    name="Scenario Contribution (%)",
+                ))
+                fig.update_layout(
+                    title="Top Scenario Contributions to Portfolio ΔReturn",
+                    xaxis_title="Contribution (%)",
+                    yaxis_title="",
+                    height=700,
+                    showlegend=False,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+    
+                show_cols = ["Symbol", "Company", "Sector", "Weight", f"Beta_{fx_ticker}", f"Beta_{rate_ticker}", "Delta_Return_%", "Contribution_%"]
+                st.dataframe(impact_df[show_cols], use_container_width=True, height=560)
+    
+                st.caption("Interpretation: Contribution ≈ Weight × (beta_FX×shock_FX + beta_Rate×shock_Rate).")
+    
+        
+
+    with tabs[7]:
         w_df = pd.DataFrame({
             "Symbol": loaded,
             "Company": [name_map.get(t, t) for t in loaded],
@@ -1278,9 +1696,27 @@ def main():
                 mime="text/csv",
             )
 
-    with tabs[6]:
+    with tabs[8]:
         st.markdown("**Excel report (one file)**")
         sheets = {
+
+            "About": pd.DataFrame({
+                "Item": [
+                    "Credits",
+                    "Generated",
+                    "Universe Size",
+                    "Method",
+                    "Benchmark",
+                ],
+                "Value": [
+                    "The Quantitative Analysis Performed by LabGen25@Istanbul by Murat KONUKLAR 2026",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    str(len(loaded)),
+                    method,
+                    benchmark_label if bench_aligned is not None else "None",
+                ],
+            }),
+
             "Weights": pd.DataFrame({
                 "Symbol": loaded,
                 "Company": [name_map.get(t, t) for t in loaded],
@@ -1288,6 +1724,7 @@ def main():
                 "Weight": weights,
             }),
             "RiskMetrics": risk_df.copy(),
+            "ActiveRisk": active_df_export.copy(),
             "PerfReport": perf.to_frame(name="Value").reset_index().rename(columns={"index": "Metric"}),
             "VaR_ES": var_tbl.copy(),
         }
